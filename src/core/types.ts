@@ -62,6 +62,7 @@ export interface SearchResult {
   chunk_source: 'compiled_truth' | 'timeline';
   score: number;
   stale: boolean;
+  source_url?: string;
 }
 
 export interface SearchOpts {

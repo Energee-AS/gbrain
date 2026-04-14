@@ -182,6 +182,7 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT DISTINCT ON (p.slug)
         p.slug, p.id as page_id, p.title, p.type,
         cc.chunk_text, cc.chunk_source,
+        p.frontmatter->>'source_url' AS source_url,
         ts_rank(p.search_vector, websearch_to_tsquery('english', $1)) AS score,
         CASE WHEN p.updated_at < (
           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
@@ -214,6 +215,7 @@ export class PGLiteEngine implements BrainEngine {
       `SELECT
         p.slug, p.id as page_id, p.title, p.type,
         cc.chunk_text, cc.chunk_source,
+        p.frontmatter->>'source_url' AS source_url,
         1 - (cc.embedding <=> $1::vector) AS score,
         CASE WHEN p.updated_at < (
           SELECT MAX(te.created_at) FROM timeline_entries te WHERE te.page_id = p.id
