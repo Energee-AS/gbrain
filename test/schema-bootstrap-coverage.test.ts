@@ -55,6 +55,16 @@ const REQUIRED_BOOTSTRAP_COVERAGE: ForwardReference[] = [
   // v0.19+ — forward-referenced by `CREATE INDEX idx_chunks_language
   // ON content_chunks(language) WHERE language IS NOT NULL`.
   { kind: 'column', table: 'content_chunks', column: 'language' },
+  // v0.20+ — forward-referenced by `CREATE INDEX idx_chunks_search_vector
+  // ON content_chunks USING GIN(search_vector)`.
+  { kind: 'column', table: 'content_chunks', column: 'search_vector' },
+  // v0.20+ — referenced by the `chunk_search_vector_trigger BEFORE UPDATE OF
+  // chunk_text, doc_comment, symbol_name_qualified` clause. CREATE TRIGGER
+  // validates the column list at create time, so missing columns fail SCHEMA_SQL.
+  { kind: 'column', table: 'content_chunks', column: 'doc_comment' },
+  // v0.20+ — same trigger column list, plus `CREATE INDEX idx_chunks_symbol_qualified
+  // ON content_chunks(symbol_name_qualified) WHERE symbol_name_qualified IS NOT NULL`.
+  { kind: 'column', table: 'content_chunks', column: 'symbol_name_qualified' },
 ];
 
 test('applyForwardReferenceBootstrap covers every forward reference declared in REQUIRED_BOOTSTRAP_COVERAGE', async () => {
@@ -84,6 +94,14 @@ test('applyForwardReferenceBootstrap covers every forward reference declared in 
       DROP INDEX IF EXISTS idx_chunks_language;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS symbol_name;
       ALTER TABLE content_chunks DROP COLUMN IF EXISTS language;
+
+      DROP TRIGGER IF EXISTS chunk_search_vector_trigger ON content_chunks;
+      DROP FUNCTION IF EXISTS update_chunk_search_vector;
+      DROP INDEX IF EXISTS idx_chunks_search_vector;
+      DROP INDEX IF EXISTS idx_chunks_symbol_qualified;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS search_vector;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS doc_comment;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS symbol_name_qualified;
     `);
 
     // Run bootstrap in isolation (NOT initSchema). This is what we're testing.
@@ -137,6 +155,18 @@ test('after bootstrap, PGLITE_SCHEMA_SQL replays without crashing on missing for
       ALTER TABLE links DROP CONSTRAINT IF EXISTS links_from_to_type_source_origin_unique;
       ALTER TABLE links DROP COLUMN IF EXISTS link_source;
       ALTER TABLE links DROP COLUMN IF EXISTS origin_page_id;
+
+      DROP TRIGGER IF EXISTS chunk_search_vector_trigger ON content_chunks;
+      DROP FUNCTION IF EXISTS update_chunk_search_vector;
+      DROP INDEX IF EXISTS idx_chunks_search_vector;
+      DROP INDEX IF EXISTS idx_chunks_symbol_qualified;
+      DROP INDEX IF EXISTS idx_chunks_symbol_name;
+      DROP INDEX IF EXISTS idx_chunks_language;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS search_vector;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS doc_comment;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS symbol_name_qualified;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS symbol_name;
+      ALTER TABLE content_chunks DROP COLUMN IF EXISTS language;
     `);
 
     // Bootstrap, then schema replay. Either step crashing fails the test.

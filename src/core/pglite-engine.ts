@@ -114,6 +114,12 @@ export class PGLiteEngine implements BrainEngine {
    *   - `links.origin_page_id` column (indexed by `idx_links_origin`) — v0.13
    *   - `content_chunks.symbol_name` column (indexed by `idx_chunks_symbol_name`) — v0.19
    *   - `content_chunks.language` column (indexed by `idx_chunks_language`) — v0.19
+   *   - `content_chunks.search_vector` column (indexed by `idx_chunks_search_vector`,
+   *     populated by `chunk_search_vector_trigger`) — v0.20
+   *   - `content_chunks.doc_comment` column (referenced by the trigger's
+   *     `BEFORE UPDATE OF` clause and the `update_chunk_search_vector` body) — v0.20
+   *   - `content_chunks.symbol_name_qualified` column (indexed by
+   *     `idx_chunks_symbol_qualified`, also referenced by the trigger) — v0.20
    *
    * **Maintenance contract:** when a future migration adds a column-with-index
    * or new-table-with-FK referenced by PGLITE_SCHEMA_SQL, extend this method
@@ -139,7 +145,13 @@ export class PGLiteEngine implements BrainEngine {
         EXISTS (SELECT 1 FROM information_schema.columns
                 WHERE table_schema='public' AND table_name='content_chunks' AND column_name='symbol_name') AS symbol_name_exists,
         EXISTS (SELECT 1 FROM information_schema.columns
-                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='language') AS language_exists
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='language') AS language_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='search_vector') AS search_vector_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='doc_comment') AS doc_comment_exists,
+        EXISTS (SELECT 1 FROM information_schema.columns
+                WHERE table_schema='public' AND table_name='content_chunks' AND column_name='symbol_name_qualified') AS symbol_name_qualified_exists
     `);
     const probe = rows[0] as {
       pages_exists: boolean;
@@ -150,13 +162,18 @@ export class PGLiteEngine implements BrainEngine {
       chunks_exists: boolean;
       symbol_name_exists: boolean;
       language_exists: boolean;
+      search_vector_exists: boolean;
+      doc_comment_exists: boolean;
+      symbol_name_qualified_exists: boolean;
     };
 
     const needsPagesBootstrap = probe.pages_exists && !probe.source_id_exists;
     const needsLinksBootstrap = probe.links_exists
       && (!probe.link_source_exists || !probe.origin_page_id_exists);
     const needsChunksBootstrap = probe.chunks_exists
-      && (!probe.symbol_name_exists || !probe.language_exists);
+      && (!probe.symbol_name_exists || !probe.language_exists
+          || !probe.search_vector_exists || !probe.doc_comment_exists
+          || !probe.symbol_name_qualified_exists);
 
     // Fresh installs (no tables yet) and modern brains both no-op.
     if (!needsPagesBootstrap && !needsLinksBootstrap && !needsChunksBootstrap) return;
@@ -198,13 +215,20 @@ export class PGLiteEngine implements BrainEngine {
 
     if (needsChunksBootstrap) {
       // v26 (content_chunks_code_metadata) adds the full code-chunk metadata
-      // surface (language, symbol_name, symbol_type, start_line, end_line).
-      // The bootstrap only adds the two columns the schema blob's partial
-      // indexes reference (idx_chunks_symbol_name, idx_chunks_language).
-      // v26 runs later via runMigrations and adds the rest idempotently.
+      // surface (language, symbol_name, symbol_type, start_line, end_line);
+      // v27/v28 (cathedral_ii) adds the chunk-grain FTS column and qualified-
+      // symbol metadata. The bootstrap only adds the columns the schema blob's
+      // indexes (idx_chunks_symbol_name, idx_chunks_language,
+      // idx_chunks_search_vector, idx_chunks_symbol_qualified) and trigger
+      // (chunk_search_vector_trigger BEFORE UPDATE OF chunk_text, doc_comment,
+      // symbol_name_qualified) reference. The migrations run later via
+      // runMigrations and add the rest idempotently.
       await this.db.exec(`
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS language TEXT;
         ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS symbol_name TEXT;
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS doc_comment TEXT;
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS symbol_name_qualified TEXT;
+        ALTER TABLE content_chunks ADD COLUMN IF NOT EXISTS search_vector TSVECTOR;
       `);
     }
   }
