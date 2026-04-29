@@ -803,19 +803,33 @@ describe('PGLiteEngine: search since filter', () => {
   });
 
   test('searchKeyword respects since', async () => {
-    await engine.putPage('test/old-page', { ...testPage, compiled_truth: 'NovaMind launched in 2023.' });
-    await new Promise(r => setTimeout(r, 10));
-    const cutoff = new Date();
-    await new Promise(r => setTimeout(r, 10));
-    await engine.putPage('test/new-page', { ...testPage, compiled_truth: 'NovaMind raised Series A.' });
+    // searchKeyword ranks against content_chunks.search_vector (v0.20 Cathedral II
+    // Layer 3), so each page needs an explicit upsertChunks call — putPage alone
+    // does not populate content_chunks.
+    await engine.putPage('concepts/old-page', { ...testPage, compiled_truth: 'NovaMind launched in 2023.' });
+    await engine.upsertChunks('concepts/old-page', [
+      { chunk_index: 0, chunk_text: 'NovaMind launched in 2023.', chunk_source: 'compiled_truth' },
+    ]);
+    const oldPage = await engine.getPage('concepts/old-page');
+    if (!oldPage) throw new Error('old-page not found');
+    // Derive cutoff from the DB's own clock, not Date.now() — avoids cross-clock
+    // skew and microsecond-granularity flake on slow CI runners.
+    const cutoff = new Date(oldPage.created_at.getTime() + 1);
+    // Ensure PGLite's NOW() advances between the two transactions so the new
+    // page's created_at is strictly greater than oldPage's (and >= cutoff).
+    await new Promise(r => setTimeout(r, 5));
+    await engine.putPage('concepts/new-page', { ...testPage, compiled_truth: 'NovaMind raised Series A.' });
+    await engine.upsertChunks('concepts/new-page', [
+      { chunk_index: 0, chunk_text: 'NovaMind raised Series A.', chunk_source: 'compiled_truth' },
+    ]);
 
     const recent = await engine.searchKeyword('novamind', { since: cutoff, limit: 50 });
     const slugs = recent.map(r => r.slug);
-    expect(slugs).toContain('test/new-page');
-    expect(slugs).not.toContain('test/old-page');
+    expect(slugs).toContain('concepts/new-page');
+    expect(slugs).not.toContain('concepts/old-page');
 
     const all = await engine.searchKeyword('novamind', { limit: 50 });
-    expect(all.map(r => r.slug)).toContain('test/old-page');
+    expect(all.map(r => r.slug)).toContain('concepts/old-page');
   });
 });
 
