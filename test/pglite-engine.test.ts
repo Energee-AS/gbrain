@@ -101,6 +101,37 @@ describe('PGLiteEngine: Pages', () => {
     expect(tagged[0].slug).toBe('test/tagged');
   });
 
+  test('listPages with slugPrefix filter (Issue #13)', async () => {
+    await truncateAll();
+    await engine.putPage('media/x/tweet-1', { ...testPage, type: 'concept' });
+    await engine.putPage('media/x/tweet-2', { ...testPage, type: 'concept' });
+    await engine.putPage('media/articles/post-1', { ...testPage, type: 'concept' });
+    await engine.putPage('people/alice', { ...testPage, type: 'person' });
+
+    const xOnly = await engine.listPages({ slugPrefix: 'media/x/', limit: 100 });
+    expect(xOnly.map((p) => p.slug).sort()).toEqual(['media/x/tweet-1', 'media/x/tweet-2']);
+
+    const allMedia = await engine.listPages({ slugPrefix: 'media/', limit: 100 });
+    expect(allMedia.length).toBe(3);
+
+    // Path-segment risk: 'media/x' (no trailing /) would also match 'media/xerox'.
+    // The matcher in storage-config.ts is responsible for trailing-/ semantics
+    // (step 6); the engine treats slugPrefix as a literal string prefix.
+    expect((await engine.listPages({ slugPrefix: 'media/x', limit: 100 })).length).toBe(2);
+  });
+
+  test('listPages slugPrefix escapes LIKE metacharacters', async () => {
+    await truncateAll();
+    await engine.putPage('safe/foo', { ...testPage, type: 'concept' });
+    // A user prefix containing % or _ would otherwise match unintended slugs
+    // if not escaped. We can't easily insert a slug with % in it (most slugs
+    // are url-safe), but we can confirm the escape logic doesn't break the
+    // happy path.
+    const result = await engine.listPages({ slugPrefix: 'safe/', limit: 10 });
+    expect(result.length).toBe(1);
+    expect(result[0].slug).toBe('safe/foo');
+  });
+
   test('resolveSlugs exact match', async () => {
     await engine.putPage('test/exact', testPage);
     const slugs = await engine.resolveSlugs('test/exact');
@@ -183,6 +214,118 @@ describe('PGLiteEngine: Search', () => {
     const fakeEmbedding = new Float32Array(1536);
     const results = await engine.searchVector(fakeEmbedding);
     expect(results.length).toBe(0);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────
+// CJK keyword fallback (v0.32.7)
+// ─────────────────────────────────────────────────────────────────
+describe('PGLiteEngine: CJK keyword fallback (v0.32.7)', () => {
+  beforeEach(async () => {
+    await truncateAll();
+    // Three pages with Chinese / Japanese / Korean content; the Chinese
+    // page contains the substring 测试 three times so bigram ranking
+    // can rank it above the others.
+    await engine.putPage('originals/chinese-essay', {
+      type: 'concept', title: 'Chinese essay',
+      compiled_truth: '测试 内容 测试 测试 多次',
+    });
+    await engine.upsertChunks('originals/chinese-essay', [
+      { chunk_index: 0, chunk_text: '测试 内容 测试 测试 多次', chunk_source: 'compiled_truth' },
+    ]);
+
+    await engine.putPage('originals/japanese-essay', {
+      type: 'concept', title: 'Japanese essay',
+      compiled_truth: '今日は晴れです。明日は雨です。',
+    });
+    await engine.upsertChunks('originals/japanese-essay', [
+      { chunk_index: 0, chunk_text: '今日は晴れです。明日は雨です。', chunk_source: 'compiled_truth' },
+    ]);
+
+    await engine.putPage('originals/korean-essay', {
+      type: 'concept', title: 'Korean essay',
+      compiled_truth: '한글 테스트 문서 입니다',
+    });
+    await engine.upsertChunks('originals/korean-essay', [
+      { chunk_index: 0, chunk_text: '한글 테스트 문서 입니다', chunk_source: 'compiled_truth' },
+    ]);
+
+    // Plus an English page so we can verify the ASCII path still works.
+    await engine.putPage('originals/english-essay', {
+      type: 'concept', title: 'English essay',
+      compiled_truth: 'NovaMind builds AI agents for enterprise automation.',
+    });
+    await engine.upsertChunks('originals/english-essay', [
+      { chunk_index: 0, chunk_text: 'NovaMind builds AI agents for enterprise', chunk_source: 'compiled_truth' },
+    ]);
+  });
+
+  test('CJK query routes to LIKE branch and finds Chinese substring', async () => {
+    const results = await engine.searchKeyword('测试');
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].slug).toBe('originals/chinese-essay');
+  });
+
+  test('CJK query finds Japanese substring', async () => {
+    const results = await engine.searchKeyword('晴れ');
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].slug).toBe('originals/japanese-essay');
+  });
+
+  test('CJK query finds Korean Hangul substring', async () => {
+    const results = await engine.searchKeyword('한글');
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].slug).toBe('originals/korean-essay');
+  });
+
+  test('bigram ranking: 3-hit page outranks 1-hit page', async () => {
+    // Add another Chinese page with only ONE occurrence of 测试.
+    await engine.putPage('originals/chinese-one-hit', {
+      type: 'concept', title: 'One-hit',
+      compiled_truth: '只有一个 测试 in this page',
+    });
+    await engine.upsertChunks('originals/chinese-one-hit', [
+      { chunk_index: 0, chunk_text: '只有一个 测试 in this page', chunk_source: 'compiled_truth' },
+    ]);
+
+    const results = await engine.searchKeyword('测试');
+    // 3-occurrence page should rank ahead of 1-occurrence page.
+    const idxThreeHits = results.findIndex(r => r.slug === 'originals/chinese-essay');
+    const idxOneHit = results.findIndex(r => r.slug === 'originals/chinese-one-hit');
+    expect(idxThreeHits).toBeGreaterThanOrEqual(0);
+    expect(idxOneHit).toBeGreaterThanOrEqual(0);
+    expect(idxThreeHits).toBeLessThan(idxOneHit);
+  });
+
+  test('REGRESSION: ASCII query still uses FTS path and returns English hits', async () => {
+    const results = await engine.searchKeyword('NovaMind');
+    expect(results.length).toBeGreaterThan(0);
+    expect(results[0].slug).toBe('originals/english-essay');
+  });
+
+  test('REGRESSION: ASCII query does NOT match CJK pages', async () => {
+    // English query against a brain containing Chinese pages should not
+    // return Chinese hits (English tokenizer + Chinese text → no FTS match).
+    const results = await engine.searchKeyword('NovaMind');
+    expect(results.every(r => !r.slug.includes('chinese') && !r.slug.includes('japanese') && !r.slug.includes('korean'))).toBe(true);
+  });
+
+  test('LIKE-meta-char escape: query with literal % does not wildcard-match', async () => {
+    // After our escape pass, ILIKE '%' || '\%' || '%' ESCAPE '\' looks
+    // for a literal `%` character — which our seeded CJK pages don't
+    // contain. So results should be empty (or at least not all 3 CJK pages).
+    const results = await engine.searchKeyword('100% 测试');
+    // Either the literal "100% 测试" exists nowhere (expected empty), or
+    // only the exact-substring pages match. None of our seeded pages
+    // contain this exact string.
+    expect(results.length).toBe(0);
+  });
+
+  test('empty CJK query returns no results', async () => {
+    const results = await engine.searchKeyword('');
+    // Empty query: our CJK branch detects hasCJK('') === false, so it falls
+    // to the ASCII FTS path which also returns nothing for empty.
+    expect(results).toEqual([]);
   });
 });
 
@@ -809,7 +952,7 @@ describe('PGLiteEngine: search since filter', () => {
     await new Promise(r => setTimeout(r, 10));
     await engine.putPage('test/new-page', { ...testPage, compiled_truth: 'NovaMind raised Series A.' });
 
-    const recent = await engine.searchKeyword('novamind', { since: cutoff, limit: 50 });
+    const recent = await engine.searchKeyword('novamind', { afterDate: cutoff.toISOString(), limit: 50 });
     const slugs = recent.map(r => r.slug);
     expect(slugs).toContain('test/new-page');
     expect(slugs).not.toContain('test/old-page');

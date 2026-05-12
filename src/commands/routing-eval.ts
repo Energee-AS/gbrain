@@ -1,5 +1,5 @@
 /**
- * gbrain routing-eval — Standalone CLI verb for Check 5 (W2, v0.17).
+ * gbrain routing-eval — Standalone CLI verb for Check 5 (W2).
  *
  * Runs the structural routing eval against every `routing-eval.jsonl`
  * fixture in the skills tree. Exits:
@@ -8,13 +8,13 @@
  *   1   any failure
  *   2   fixtures directory not found / resolver missing (setup error)
  *
- * Layer B (LLM tie-break) via `--llm` is reserved: the flag parses and
- * surfaces in the envelope, but the harness does not yet call any model.
- * The plan ships structural layer only in v0.17. The LLM layer has
- * explicit sequencing in v0.18 once the structural baseline is stable.
+ * Layer B (LLM tie-break) via `--llm` is a placeholder: the flag parses
+ * and surfaces in the envelope, but the harness does not yet call any
+ * model. Passing `--llm` emits a stderr notice and runs the structural
+ * layer only. A future release will implement the tie-break layer.
  */
 
-import { readFileSync, existsSync } from 'fs';
+import { readFileSync } from 'fs';
 import { resolve as resolvePath, isAbsolute } from 'path';
 
 import {
@@ -25,8 +25,8 @@ import {
   type RoutingReport,
   type FixtureLintIssue,
 } from '../core/routing-eval.ts';
-import { findResolverFile, RESOLVER_FILENAMES_LABEL } from '../core/resolver-filenames.ts';
-import { autoDetectSkillsDir } from '../core/repo-root.ts';
+import { findAllResolverFiles, RESOLVER_FILENAMES_LABEL } from '../core/resolver-filenames.ts';
+import { autoDetectSkillsDirReadOnly } from '../core/repo-root.ts';
 import { join } from 'path';
 
 interface Flags {
@@ -55,7 +55,9 @@ false-positive counts. Lints fixtures for verbatim trigger copies.
 
 Options:
   --json             Machine-readable JSON envelope
-  --llm              (reserved for v0.18) Run Layer B LLM tie-break
+  --llm              Placeholder for Layer B LLM tie-break. Not yet
+                     implemented. Accepted for forward-compat; emits a
+                     stderr notice and runs the structural layer only.
   --skills-dir PATH  Override the auto-detected skills/ directory
   --help             Show this message
 
@@ -91,7 +93,7 @@ function resolveSkillsDir(
       : resolvePath(process.cwd(), flags.skillsDir);
     return { dir, source: 'explicit', error: null, message: null };
   }
-  const detected = autoDetectSkillsDir();
+  const detected = autoDetectSkillsDirReadOnly();
   if (!detected.dir) {
     return {
       dir: null,
@@ -109,6 +111,15 @@ export async function runRoutingEvalCli(args: string[]): Promise<void> {
   if (flags.help) {
     console.log(HELP);
     process.exit(0);
+  }
+
+  // --llm is a placeholder in this release. Emit a stderr notice so
+  // users (and CI logs) can see the structural-only fallback clearly,
+  // regardless of --json mode. Does not affect exit code or stdout.
+  if (flags.llm) {
+    console.error(
+      '[routing-eval] --llm flag is a placeholder in this release. Running structural layer only; a future release will implement LLM tie-break.',
+    );
   }
 
   const { dir, error, message } = resolveSkillsDir(flags);
@@ -129,8 +140,17 @@ export async function runRoutingEvalCli(args: string[]): Promise<void> {
   }
 
   const skillsDir = dir!;
-  const resolverFile =
-    findResolverFile(skillsDir) ?? findResolverFile(join(skillsDir, '..'));
+  // v0.31.7 D6 fix: collect entries from ALL resolver files across both the
+  // skills directory and its parent, matching the multi-file merge behavior
+  // in src/core/check-resolvable.ts. Without this, OpenClaw deployments
+  // (thin skills/RESOLVER.md + rich ../AGENTS.md) would have routing-eval
+  // see only the thin file's triggers and report false misses/ambiguity
+  // while doctor and check-resolvable see the full merged index.
+  const allResolverPaths = [
+    ...findAllResolverFiles(skillsDir),
+    ...findAllResolverFiles(join(skillsDir, '..')),
+  ];
+  const resolverFile = allResolverPaths[0] ?? null;
   if (!resolverFile) {
     const env: RoutingEvalEnvelope = {
       ok: false,
@@ -147,7 +167,11 @@ export async function runRoutingEvalCli(args: string[]): Promise<void> {
     process.exit(2);
   }
 
-  const resolverContent = readFileSync(resolverFile, 'utf-8');
+  // Build combined resolverContent across all matched files (RESOLVER.md +
+  // ../AGENTS.md, etc.), so indexResolverTriggers sees the union.
+  const resolverContent = allResolverPaths
+    .map(p => readFileSync(p, 'utf-8'))
+    .join('\n\n');
   const index = indexResolverTriggers(resolverContent);
 
   const loaded = loadRoutingFixtures(skillsDir);
@@ -200,9 +224,9 @@ export async function runRoutingEvalCli(args: string[]): Promise<void> {
     for (const m of loaded.malformed) {
       console.log(`  [malformed] ${m.file}:${m.line} — ${m.error}`);
     }
-    if (flags.llm) {
-      console.log('\nNote: --llm (Layer B LLM tie-break) is reserved for v0.18. No model calls made.');
-    }
+    // The stderr notice emitted at the top of runRoutingEvalCli
+    // already informed the user that --llm is a placeholder; do not
+    // repeat it here. Stdout in human mode stays results-only.
   }
 
   process.exit(ok ? 0 : 1);

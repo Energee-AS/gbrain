@@ -16,9 +16,15 @@
  *   │ Phase 1: lint --fix         (filesystem writes, no DB)    │
  *   │ Phase 2: backlinks --fix    (filesystem writes, no DB)    │
  *   │ Phase 3: sync               (DB picks up phases 1+2)      │
- *   │ Phase 4: extract            (DB picks up links from sync) │
- *   │ Phase 5: embed --stale      (DB writes)                   │
- *   │ Phase 6: orphans            (DB read, report only)        │
+ *   │ Phase 4: synthesize         (v0.23: transcripts → pages)  │
+ *   │ Phase 5: extract            (DB picks up links from sync  │
+ *   │                              + synthesize)                │
+ *   │ Phase 6: patterns           (v0.23: cross-session themes; │
+ *   │                              MUST be after extract so     │
+ *   │                              graph state is fresh)        │
+ *   │ Phase 7: recompute_emotional_weight (v0.29: DB writes)    │
+ *   │ Phase 8: embed --stale      (DB writes)                   │
+ *   │ Phase 9: orphans            (DB read, report only)        │
  *   └───────────────────────────────────────────────────────────┘
  *
  * COORDINATION:
@@ -39,35 +45,71 @@
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSync } from 'fs';
 import { join } from 'path';
-import { homedir, hostname } from 'os';
+import { hostname } from 'os';
+import { gbrainPath } from './config.ts';
 import type { BrainEngine } from './engine.ts';
 import { createProgress, type ProgressReporter } from './progress.ts';
 import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 
 // ─── Types ─────────────────────────────────────────────────────────
 
-export type CyclePhase = 'lint' | 'backlinks' | 'sync' | 'extract' | 'embed' | 'orphans';
+export type CyclePhase =
+  | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
+  | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
+  | 'embed' | 'orphans' | 'purge';
 
 export const ALL_PHASES: CyclePhase[] = [
   'lint',
   'backlinks',
   'sync',
+  'synthesize',
   'extract',
+  // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
+  // every affected entity page. Runs AFTER extract (link/timeline
+  // materialization) and BEFORE patterns (which reads graph state).
+  // The empty-fence guard refuses to run if pre-v51 legacy facts are
+  // pending the v0_32_2 backfill (Codex R2-#7).
+  'extract_facts',
+  'patterns',
+  // v0.29 — runs AFTER extract + synthesize so it sees the union of
+  // sync-touched + synthesize-written pages with fresh tag + take state.
+  'recompute_emotional_weight',
+  // v0.31: cluster unconsolidated facts per (source_id, entity_slug);
+  // Sonnet-synthesize one take per cluster; INSERT into takes(kind='fact');
+  // mark facts consolidated_at + consolidated_into. Never DELETE — facts
+  // stay as audit trail. Placed AFTER patterns (graph-fresh) and BEFORE
+  // embed (so the new takes get embedded same-cycle).
+  'consolidate',
   'embed',
   'orphans',
+  // v0.26.5: hard-deletes soft-deleted pages and expired archived sources past
+  // the 72h recovery window. Runs last so the rest of the cycle sees the
+  // recoverable set; the purge then drops what's expired.
+  'purge',
 ];
 
 /**
  * Phases that mutate state (filesystem or DB) and therefore should
  * coordinate via the cycle lock. Only orphans is truly read-only
- * and skips the lock.
+ * and skips the lock. patterns mutates DB (writes pattern pages) so
+ * it acquires the lock; synthesize too. v0.26.5 adds purge (DELETE-cascade
+ * across pages and sources). v0.31 adds consolidate (writes takes rows
+ * + facts UPDATEs).
  */
 const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'lint',
   'backlinks',
   'sync',
+  'synthesize',
   'extract',
+  // v0.32.2 — wipes + re-inserts facts per affected page.
+  'extract_facts',
+  'patterns',
+  // v0.29 — writes pages.emotional_weight column.
+  'recompute_emotional_weight',
+  'consolidate',
   'embed',
+  'purge',
 ]);
 
 export type PhaseStatus = 'ok' | 'warn' | 'fail' | 'skipped';
@@ -121,6 +163,22 @@ export interface CycleReport {
     pages_extracted: number;
     pages_embedded: number;
     orphans_found: number;
+    /** v0.23: number of transcripts the synthesize phase processed (judged + dispatched). */
+    transcripts_processed: number;
+    /** v0.23: number of new reflection/original/people pages written by synthesize. */
+    synth_pages_written: number;
+    /** v0.23: number of pattern pages written/updated by patterns phase. */
+    patterns_written: number;
+    /** v0.29: number of pages whose emotional_weight was (re)computed. */
+    pages_emotional_weight_recomputed: number;
+    /** v0.26.5: number of source rows hard-deleted by the purge phase. */
+    purged_sources_count: number;
+    /** v0.26.5: number of page rows hard-deleted by the purge phase. */
+    purged_pages_count: number;
+    /** v0.31: number of facts promoted to takes by the consolidate phase. */
+    facts_consolidated: number;
+    /** v0.31: number of new takes created by the consolidate phase. */
+    consolidate_takes_written: number;
   };
 }
 
@@ -141,11 +199,37 @@ export interface CycleOpts {
    */
   yieldBetweenPhases?: () => Promise<void>;
   /**
-   * AbortSignal from the Minions worker. When aborted (timeout, cancel,
-   * lock-loss), runCycle bails between phases and returns a 'failed' report
-   * instead of running the next phase. Without this, a timed-out
-   * autopilot-cycle handler ignores the abort and runs until the worker
-   * wedges (the 98-waiting-0-active incident on 2026-04-24).
+   * Generic in-phase keepalive (v0.23). Long-running phases (synthesize
+   * waiting on a fan-out aggregator, patterns rolling up reflections)
+   * call this periodically while idle to renew the cycle-lock TTL and
+   * the Minions worker job lock. Mirrors `yieldBetweenPhases` shape;
+   * passing the same function for both is the common case.
+   */
+  yieldDuringPhase?: () => Promise<void>;
+  /**
+   * Synthesize phase scope overrides (v0.23). Forwarded to runPhaseSynthesize.
+   * - `synthInputFile`: ad-hoc transcript path (`gbrain dream --input <file>`).
+   * - `synthDate` / `synthFrom` / `synthTo`: date filters for corpus scan.
+   * Mutually exclusive with each other in CLI parsing; runner trusts the
+   * caller (CLI wrapper validates).
+   */
+  synthInputFile?: string;
+  synthDate?: string;
+  synthFrom?: string;
+  synthTo?: string;
+  /**
+   * v0.23.2: explicit opt-in to disable the synthesize self-consumption guard.
+   * Wired from `gbrain dream --unsafe-bypass-dream-guard`. Never auto-applied
+   * for `--input` because that would let any caller silently re-trigger the
+   * loop bug (codex finding #3).
+   */
+  synthBypassDreamGuard?: boolean;
+  /**
+   * AbortSignal from the Minions worker (v0.22.1, #403). When aborted
+   * (timeout, cancel, lock-loss), runCycle bails between phases and
+   * returns a 'failed' report instead of running the next phase. Without
+   * this, a timed-out autopilot-cycle handler ignores the abort and runs
+   * until the worker wedges (the 98-waiting-0-active incident on 2026-04-24).
    */
   signal?: AbortSignal;
 }
@@ -154,7 +238,8 @@ export interface CycleOpts {
 
 const CYCLE_LOCK_ID = 'gbrain-cycle';
 const LOCK_TTL_MS = 30 * 60 * 1000;       // 30 minutes
-const LOCK_FILE_PATH_DEFAULT = join(homedir(), '.gbrain', 'cycle.lock');
+// Lazy: GBRAIN_HOME may be set after module load; resolve at call time.
+const getLockFilePathDefault = () => gbrainPath('cycle.lock');
 
 interface LockHandle {
   release: () => Promise<void>;
@@ -256,7 +341,7 @@ async function acquirePostgresLock(engine: BrainEngine): Promise<LockHandle | nu
  * The file contains `{pid}\n{iso-timestamp}`. Staleness = mtime older
  * than LOCK_TTL_MS OR the PID is no longer alive on this host.
  */
-function acquireFileLock(lockPath = LOCK_FILE_PATH_DEFAULT): LockHandle | null {
+function acquireFileLock(lockPath = getLockFilePathDefault()): LockHandle | null {
   mkdirSync(join(lockPath, '..'), { recursive: true });
   const pid = process.pid;
 
@@ -576,6 +661,61 @@ async function runPhaseExtract(
   }
 }
 
+async function runPhaseExtractFacts(
+  engine: BrainEngine,
+  dryRun: boolean,
+  changedSlugs?: string[],
+): Promise<PhaseResult> {
+  try {
+    const { runExtractFacts } = await import('./cycle/extract-facts.ts');
+    const result = await runExtractFacts(engine, {
+      slugs: changedSlugs,
+      dryRun,
+    });
+
+    // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
+    // Surface as 'warn' so doctor + the cycle report can see it; don't fail
+    // the cycle because the workaround is well-defined (run apply-migrations).
+    if (result.guardTriggered) {
+      return {
+        phase: 'extract_facts',
+        status: 'warn',
+        duration_ms: 0,
+        summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
+        details: {
+          legacyRowsPending: result.legacyRowsPending,
+          hint: 'gbrain apply-migrations --yes',
+          warnings: result.warnings,
+        },
+      };
+    }
+
+    return {
+      phase: 'extract_facts',
+      status: result.warnings.length > 0 ? 'warn' : 'ok',
+      duration_ms: 0,
+      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)` +
+        (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
+      details: {
+        pagesScanned: result.pagesScanned,
+        pagesWithFacts: result.pagesWithFacts,
+        factsInserted: result.factsInserted,
+        factsDeleted: result.factsDeleted,
+        warnings: result.warnings.slice(0, 5),
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'extract_facts',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'extract_facts phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
 async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
   try {
     const { runEmbedCore } = await import('../commands/embed.ts');
@@ -612,6 +752,101 @@ async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean): Promise<Phas
     };
   }
 }
+
+/**
+ * v0.26.5 — purge phase. Hard-deletes:
+ *  - source rows where `archived = true AND archive_expires_at <= now()`
+ *    (paired with the cascade FK to `pages`, this also drops the source's pages)
+ *  - page rows where `deleted_at` is older than 72h
+ *
+ * Cascade on `pages` covers `content_chunks`, `page_links`, `chunk_relations`.
+ * `dryRun` short-circuits — no DELETEs are issued.
+ *
+ * Mirrors the operator escape hatches: `gbrain sources purge` (no id) and
+ * `gbrain pages purge-deleted` both call the same library functions, so
+ * scripted purges and the autopilot phase converge on a single behavior.
+ */
+/**
+ * v0.28 P1: sweep $GBRAIN_HOME/clones/.tmp/ for entries older than the
+ * configured TTL. addSource / recloneIfMissing clone into temp first then
+ * rename atomically; if the process is SIGKILL'd between clone and rename,
+ * the temp dir orphans. Without this sweep, a brain server accumulates
+ * gigabytes over months. Mirrors the page/source soft-delete TTL pattern
+ * so behavior is uniform across the purge phase.
+ */
+async function purgeOrphanClones(staleHours: number): Promise<{ count: number; bytes: number; names: string[] }> {
+  const fs = await import('fs');
+  const cfg = await import('./config.ts');
+  const tmpRoot = cfg.gbrainPath('clones', '.tmp');
+  if (!fs.existsSync(tmpRoot)) return { count: 0, bytes: 0, names: [] };
+  const STALE_MS = staleHours * 3600 * 1000;
+  const now = Date.now();
+  const removed: string[] = [];
+  let bytes = 0;
+  for (const ent of fs.readdirSync(tmpRoot, { withFileTypes: true })) {
+    const full = `${tmpRoot}/${ent.name}`;
+    try {
+      const st = fs.lstatSync(full);
+      if (now - st.mtimeMs <= STALE_MS) continue;
+      // Approximate size via stat (rough — recursive walk would be slow on
+      // a stuck-clone with thousands of files; the bytes field is just
+      // operator-visible feedback, not load-bearing).
+      try { bytes += st.size; } catch { /* skip */ }
+      fs.rmSync(full, { recursive: true, force: true });
+      removed.push(ent.name);
+    } catch {
+      /* skip unreadable / racing-with-another-process */
+    }
+  }
+  return { count: removed.length, bytes, names: removed };
+}
+
+async function runPhasePurge(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
+  try {
+    if (dryRun) {
+      return {
+        phase: 'purge',
+        status: 'ok',
+        duration_ms: 0,
+        summary: 'dry-run: skipped purge sweep',
+        details: { dry_run: true, purged_sources_count: 0, purged_pages_count: 0, purged_orphan_clones_count: 0 },
+      };
+    }
+    const { purgeExpiredSources } = await import('./destructive-guard.ts');
+    const purgedSources = await purgeExpiredSources(engine);
+    const purgedPages = await engine.purgeDeletedPages(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    const purgedClones = await purgeOrphanClones(SOFT_DELETE_TTL_HOURS_FOR_PURGE);
+    return {
+      phase: 'purge',
+      status: 'ok',
+      duration_ms: 0,
+      summary:
+        `purged ${purgedSources.length} source(s), ${purgedPages.count} page(s), and ` +
+        `${purgedClones.count} orphan clone temp dir(s) past the 72h recovery window`,
+      details: {
+        purged_sources_count: purgedSources.length,
+        purged_pages_count: purgedPages.count,
+        purged_orphan_clones_count: purgedClones.count,
+        purged_orphan_clone_names: purgedClones.names,
+        purged_sources: purgedSources,
+        purged_page_slugs: purgedPages.slugs,
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'purge',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'purge phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
+/** v0.26.5: matches SOFT_DELETE_TTL_HOURS in destructive-guard.ts. Inlined here
+ *  to avoid a static import (purge phase is only loaded in the autopilot path). */
+const SOFT_DELETE_TTL_HOURS_FOR_PURGE = 72;
 
 async function runPhaseOrphans(engine: BrainEngine): Promise<PhaseResult> {
   try {
@@ -739,8 +974,11 @@ export async function runCycle(
     }
 
     // ── Phase 3: sync ───────────────────────────────────────────
-    // Track which slugs sync touched so extract can run incrementally.
+    // Track which slugs sync touched so extract can run incrementally,
+    // and which slugs synthesize wrote so recompute_emotional_weight can
+    // pick up the union of (sync ∪ synthesize) for v0.29 incremental mode.
     let syncPagesAffected: string[] | undefined;
+    let synthesizeWrittenSlugs: string[] | undefined;
     if (phases.includes('sync')) {
       checkAborted(opts.signal);
       if (!engine) {
@@ -763,7 +1001,42 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── Phase 4: extract ────────────────────────────────────────
+    // ── Phase 4: synthesize (v0.23) ─────────────────────────────
+    if (phases.includes('synthesize')) {
+      if (!engine) {
+        phaseResults.push({
+          phase: 'synthesize',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.synthesize');
+        const { runPhaseSynthesize } = await import('./cycle/synthesize.ts');
+        const { result, duration_ms } = await timePhase(() => runPhaseSynthesize(engine, {
+          brainDir: opts.brainDir,
+          dryRun,
+          yieldDuringPhase: opts.yieldDuringPhase,
+          inputFile: opts.synthInputFile,
+          date: opts.synthDate,
+          from: opts.synthFrom,
+          to: opts.synthTo,
+          bypassDreamGuard: opts.synthBypassDreamGuard,
+        }));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        // v0.29: capture synthesize-written slugs so the recompute_emotional_weight
+        // phase can union them with sync's pagesAffected for incremental mode.
+        if (result.details && Array.isArray(result.details.written_slugs)) {
+          synthesizeWrittenSlugs = result.details.written_slugs as string[];
+        }
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 5: extract (now picks up synthesize output) ───────
     if (phases.includes('extract')) {
       checkAborted(opts.signal);
       if (!engine) {
@@ -787,7 +1060,132 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── Phase 5: embed ──────────────────────────────────────────
+    // ── Phase 5b: extract_facts (v0.32.2) ───────────────────────
+    // Reconcile DB facts index from the `## Facts` fence on every
+    // affected entity page. Runs AFTER extract (link/timeline
+    // materialization) and BEFORE patterns/recompute_emotional_weight
+    // so downstream phases see fresh DB facts. Empty-fence guard
+    // refuses to run while v0.31 legacy facts are pending the
+    // v0_32_2 backfill (Codex R2-#7).
+    if (phases.includes('extract_facts')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'extract_facts',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.extract_facts');
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseExtractFacts(engine, dryRun, syncPagesAffected));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 6: patterns (v0.23) ───────────────────────────────
+    // MUST run after extract so the graph state reads fresh — subagent
+    // put_page calls in synthesize set ctx.remote=true, so auto-link
+    // only fires for trusted-workspace writes (allow-listed). extract
+    // is the canonical materialization step.
+    if (phases.includes('patterns')) {
+      if (!engine) {
+        phaseResults.push({
+          phase: 'patterns',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.patterns');
+        const { runPhasePatterns } = await import('./cycle/patterns.ts');
+        const { result, duration_ms } = await timePhase(() => runPhasePatterns(engine, {
+          brainDir: opts.brainDir,
+          dryRun,
+          yieldDuringPhase: opts.yieldDuringPhase,
+        }));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 7: recompute_emotional_weight (v0.29) ─────────────
+    // Runs AFTER extract + synthesize so it sees fresh tags + takes for
+    // every page touched in this cycle. Incremental mode uses union(sync,
+    // synthesize); full mode walks every page in the brain.
+    if (phases.includes('recompute_emotional_weight')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'recompute_emotional_weight',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.recompute_emotional_weight');
+        const { runPhaseRecomputeEmotionalWeight } = await import('./cycle/recompute-emotional-weight.ts');
+        // Determine incremental vs full mode. If sync OR synthesize ran in this
+        // cycle, do incremental over their union. If neither phase ran (e.g.,
+        // user passed `--phase recompute_emotional_weight`), do full walk.
+        const incremental: string[] | undefined =
+          (syncPagesAffected || synthesizeWrittenSlugs)
+            ? Array.from(new Set([
+                ...(syncPagesAffected ?? []),
+                ...(synthesizeWrittenSlugs ?? []),
+              ]))
+            : undefined;
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseRecomputeEmotionalWeight(engine, {
+            dryRun,
+            affectedSlugs: incremental,
+          }),
+        );
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 8 (v0.31): consolidate facts → takes ──────────────
+    // Cluster unconsolidated facts per entity, Sonnet-synthesize one take
+    // per cluster, INSERT into takes(kind='fact'), mark facts as
+    // consolidated_into. Never DELETE — facts are the audit trail.
+    if (phases.includes('consolidate')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'consolidate',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.consolidate');
+        const { runPhaseConsolidate } = await import('./cycle/phases/consolidate.ts');
+        const { result, duration_ms } = await timePhase(() => runPhaseConsolidate(engine, {
+          dryRun,
+          yieldDuringPhase: opts.yieldDuringPhase,
+        }));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 8: embed ──────────────────────────────────────────
     if (phases.includes('embed')) {
       checkAborted(opts.signal);
       if (!engine) {
@@ -808,7 +1206,7 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
-    // ── Phase 6: orphans ────────────────────────────────────────
+    // ── Phase 9: orphans ────────────────────────────────────────
     if (phases.includes('orphans')) {
       checkAborted(opts.signal);
       if (!engine) {
@@ -822,6 +1220,30 @@ export async function runCycle(
       } else {
         progress.start('cycle.orphans');
         const { result, duration_ms } = await timePhase(() => runPhaseOrphans(engine));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── Phase 9: purge (v0.26.5) ────────────────────────────────
+    // Hard-delete soft-deleted pages and expired archived sources past the
+    // 72h recovery window. Runs last so the rest of the cycle sees the
+    // recoverable set; the purge then drops what's truly expired.
+    if (phases.includes('purge')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'purge',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.purge');
+        const { result, duration_ms } = await timePhase(() => runPhasePurge(engine, dryRun));
         result.duration_ms = duration_ms;
         phaseResults.push(result);
         progress.finish();
@@ -859,6 +1281,14 @@ function emptyTotals(): CycleReport['totals'] {
     pages_extracted: 0,
     pages_embedded: 0,
     orphans_found: 0,
+    transcripts_processed: 0,
+    synth_pages_written: 0,
+    patterns_written: 0,
+    pages_emotional_weight_recomputed: 0,
+    purged_sources_count: 0,
+    purged_pages_count: 0,
+    facts_consolidated: 0,
+    consolidate_takes_written: 0,
   };
 }
 
@@ -881,6 +1311,19 @@ function extractTotals(phases: PhaseResult[]): CycleReport['totals'] {
         : Number(p.details.embedded ?? 0);
     } else if (p.phase === 'orphans' && p.details) {
       t.orphans_found = Number(p.details.total_orphans ?? 0);
+    } else if (p.phase === 'synthesize' && p.details) {
+      t.transcripts_processed = Number(p.details.transcripts_processed ?? 0);
+      t.synth_pages_written = Number(p.details.pages_written ?? 0);
+    } else if (p.phase === 'patterns' && p.details) {
+      t.patterns_written = Number(p.details.patterns_written ?? 0);
+    } else if (p.phase === 'recompute_emotional_weight' && p.details) {
+      t.pages_emotional_weight_recomputed = Number(p.details.pages_recomputed ?? 0);
+    } else if (p.phase === 'purge' && p.details) {
+      t.purged_sources_count = Number(p.details.purged_sources_count ?? 0);
+      t.purged_pages_count = Number(p.details.purged_pages_count ?? 0);
+    } else if (p.phase === 'consolidate' && p.details) {
+      t.facts_consolidated = Number(p.details.facts_consolidated ?? 0);
+      t.consolidate_takes_written = Number(p.details.takes_written ?? 0);
     }
   }
   return t;
@@ -899,6 +1342,7 @@ function deriveStatus(phases: PhaseResult[], totals: CycleReport['totals']): Cyc
     totals.backlinks_added > 0 ||
     totals.pages_synced > 0 ||
     totals.pages_extracted > 0 ||
-    totals.pages_embedded > 0;
+    totals.pages_embedded > 0 ||
+    totals.pages_emotional_weight_recomputed > 0;
   return anyWork ? 'ok' : 'clean';
 }
