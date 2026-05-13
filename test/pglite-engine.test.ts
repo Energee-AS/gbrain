@@ -945,20 +945,26 @@ describe('PGLiteEngine: search since filter', () => {
     await truncateAll();
   });
 
-  test('searchKeyword respects since', async () => {
-    await engine.putPage('test/old-page', { ...testPage, compiled_truth: 'NovaMind launched in 2023.' });
-    await new Promise(r => setTimeout(r, 10));
+  test('searchKeyword respects afterDate', async () => {
+    // importFromContent populates content_chunks so the FTS search vector
+    // actually has rows. putPage alone only writes to `pages` and leaves
+    // the chunk table empty, which silently returns zero search results.
+    // Slug prefix must avoid DEFAULT_HARD_EXCLUDES (test/, archive/, ...);
+    // notes/ is safe.
+    const { importFromContent } = await import('../src/core/import-file.ts');
+    await importFromContent(engine, 'notes/old-page', '# Old\n\nNovaMind launched in 2023.', { noEmbed: true });
+    await new Promise(r => setTimeout(r, 100));
     const cutoff = new Date();
-    await new Promise(r => setTimeout(r, 10));
-    await engine.putPage('test/new-page', { ...testPage, compiled_truth: 'NovaMind raised Series A.' });
+    await new Promise(r => setTimeout(r, 100));
+    await importFromContent(engine, 'notes/new-page', '# New\n\nNovaMind raised Series A.', { noEmbed: true });
 
     const recent = await engine.searchKeyword('novamind', { afterDate: cutoff.toISOString(), limit: 50 });
     const slugs = recent.map(r => r.slug);
-    expect(slugs).toContain('test/new-page');
-    expect(slugs).not.toContain('test/old-page');
+    expect(slugs).toContain('notes/new-page');
+    expect(slugs).not.toContain('notes/old-page');
 
     const all = await engine.searchKeyword('novamind', { limit: 50 });
-    expect(all.map(r => r.slug)).toContain('test/old-page');
+    expect(all.map(r => r.slug)).toContain('notes/old-page');
   });
 });
 

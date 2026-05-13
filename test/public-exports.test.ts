@@ -50,6 +50,7 @@ const EXPECTED_EXPORTS: ExpectedExport[] = [
   { subpath: 'gbrain/search/hybrid', canary: ['hybridSearch', 'rrfFusion'] },
   { subpath: 'gbrain/search/expansion', canary: ['expandQuery'] },
   { subpath: 'gbrain/extract', canary: [] },
+  { subpath: 'gbrain/src/*', canary: [] }, // Energee fork: wildcard for deep src/ imports
 ];
 
 function readPackageExports(): Record<string, string> {
@@ -65,7 +66,7 @@ describe('public exports — package.json exports map', () => {
     // Adding new exports: increment this + add to EXPECTED_EXPORTS below.
     // Removing exports: see CLAUDE.md "Removing any of these is a
     // breaking change going forward" — bump minor and update this count.
-    expect(count).toBe(17);
+    expect(count).toBe(18);
   });
 
   test('EXPECTED_EXPORTS list matches the exports map exactly (no drift)', () => {
@@ -78,7 +79,13 @@ describe('public exports — package.json exports map', () => {
 
 describe('public exports — every subpath resolves via package name', () => {
   for (const entry of EXPECTED_EXPORTS) {
+    // Wildcard entries (e.g. "gbrain/src/*") can't be imported as a literal.
+    // Their resolution is verified at consumer call sites; the contract test
+    // just pins their presence in the exports map.
+    const isWildcard = entry.subpath.endsWith('/*');
+
     test(`${entry.subpath} imports without throwing`, async () => {
+      if (isWildcard) return;
       // Package-path import goes through the exports map — bypassing a
       // broken/removed subpath surfaces here. Importing "../src/..."
       // would resolve via filesystem and miss the contract.
@@ -87,7 +94,7 @@ describe('public exports — every subpath resolves via package name', () => {
       expect(typeof mod).toBe('object');
     });
 
-    if (entry.canary.length > 0) {
+    if (entry.canary.length > 0 && !isWildcard) {
       test(`${entry.subpath} exports canary symbols: ${entry.canary.join(', ')}`, async () => {
         const mod = await import(entry.subpath);
         for (const name of entry.canary) {
