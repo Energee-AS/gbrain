@@ -79,29 +79,31 @@ SEED_ELAPSED=$((SECONDS - SEED_START))
 echo "[fm_wallclock] fixture seeded in ${SEED_ELAPSED}s" | tee -a "$LOG"
 
 # Step 2: init brain + register the source.
+# --no-embedding: this test only seeds markdown and runs `gbrain doctor`; it
+# never embeds. Since gbrain v0.41 `init` fail-loud requires an embedding
+# provider unless deferred, and CI has no provider key set — so defer it.
 echo "[fm_wallclock] init brain..." | tee -a "$LOG"
-timeout 120s bun run src/cli.ts init --pglite --yes >> "$LOG" 2>&1 || {
+timeout 120s bun run src/cli.ts init --pglite --yes --no-embedding >> "$LOG" 2>&1 || {
   echo "[fm_wallclock] FAIL: gbrain init exited non-zero" >&2
   echo "Log tail:" >&2
   tail -30 "$LOG" >&2
   exit 1
 }
 
-# Register the brain dir as a source. Use raw SQL since `gbrain sources add`
-# might not exist in this version-window; the schema is what doctor reads.
+# Register the brain dir as a source via the CLI so it lands in the SAME
+# persistent PGLite brain that `gbrain init` created and `gbrain doctor` reads.
+# (The earlier `bun run -e` + `new PGLiteEngine().connect({})` path resolved to
+# an in-memory DB — `database_path` unset means in-memory — so the INSERT
+# evaporated on disconnect and doctor saw "No registered sources to scan",
+# making the frontmatter scan assertion pass vacuously.)
 echo "[fm_wallclock] register source..." | tee -a "$LOG"
-bun run -e "
-import { PGLiteEngine } from './src/core/pglite-engine.ts';
-const e = new PGLiteEngine();
-await e.connect({});
-await e.initSchema();
-await e.executeRaw(
-  \"INSERT INTO sources (id, name, local_path) VALUES ('fm-wallclock', 'Frontmatter wallclock test', \\\$1)\",
-  ['$BRAIN_DIR'],
-);
-await e.disconnect();
-console.log('source registered');
-" 2>&1 | tee -a "$LOG"
+bun run src/cli.ts sources add fm-wallclock \
+  --path "$BRAIN_DIR" \
+  --name "Frontmatter wallclock test" >> "$LOG" 2>&1 || {
+  echo "[fm_wallclock] FAIL: gbrain sources add exited non-zero" >&2
+  tail -30 "$LOG" >&2
+  exit 1
+}
 
 # Step 3: run gbrain doctor; capture wall-clock + exit + frontmatter_integrity status.
 echo "[fm_wallclock] running gbrain doctor (budget ${WALLCLOCK_BUDGET_S}s)..." | tee -a "$LOG"
