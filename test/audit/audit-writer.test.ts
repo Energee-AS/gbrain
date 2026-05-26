@@ -219,11 +219,21 @@ describe('createAuditWriter — readRecent()', () => {
       const inWin2 = new Date(now.getTime() - 6 * 86400000).toISOString();
       const outOfWin = new Date(now.getTime() - 8 * 86400000).toISOString();
 
-      // All written to current-week file for simplicity (the readRecent
-      // window filter is what we're testing, not the cross-week walk).
-      writer.log({ ts: inWin1, message: 'in window 1' });
-      writer.log({ ts: inWin2, message: 'in window 2' });
-      writer.log({ ts: outOfWin, message: 'out of window' });
+      // Write all three directly to the file readRecent(now) reads (the
+      // current-week file relative to `now`). We can't use writer.log()
+      // here: log() always names the file from the REAL wall-clock week,
+      // not the event ts or the test's fixed `now`, so when the suite
+      // runs in a different ISO week than `now` the rows land in a file
+      // readRecent never reads. The ts-cutoff filter is what we're
+      // testing, not log()'s file placement (covered by the log() block
+      // above). Same direct-write pattern as the corrupt-JSON test below.
+      const file = path.join(dir, writer.computeFilename(now));
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(file, [
+        JSON.stringify({ ts: inWin1, message: 'in window 1' }),
+        JSON.stringify({ ts: inWin2, message: 'in window 2' }),
+        JSON.stringify({ ts: outOfWin, message: 'out of window' }),
+      ].join('\n') + '\n');
 
       const recent = writer.readRecent(7, now);
       expect(recent.length).toBe(2);
@@ -249,9 +259,13 @@ describe('createAuditWriter — readRecent()', () => {
       fs.mkdirSync(dir, { recursive: true });
       fs.appendFileSync(previousFile, JSON.stringify({ ts: previousTs, message: 'previous' }) + '\n');
 
-      // Write a current-week event.
+      // Write the current-week event directly to the current-week file
+      // relative to `now`. writer.log() would name the file from the real
+      // wall-clock week, so this assertion only held when the suite ran in
+      // the same ISO week as `now` — flaky across week boundaries.
       const currentTs = new Date(now.getTime() - 1 * 86400000).toISOString();
-      writer.log({ ts: currentTs, message: 'current' });
+      const currentFile = path.join(dir, writer.computeFilename(now));
+      fs.appendFileSync(currentFile, JSON.stringify({ ts: currentTs, message: 'current' }) + '\n');
 
       const recent = writer.readRecent(7, now);
       const messages = recent.map(e => e.message).sort();
