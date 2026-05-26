@@ -2,16 +2,28 @@
 # tests/heavy/sync_lock_regression.sh
 # Sync writer-lock concurrency regression test.
 #
-# Spawns N concurrent `gbrain sync` processes against one DB; asserts:
-#   1. Exactly one wins the writer lock (`gbrain-sync` row in `gbrain_cycle_locks`).
-#   2. N-1 lose with "Another sync is in progress" — they fail FAST, they don't queue.
-#      (Per src/commands/sync.ts:377 — performSync uses `tryAcquireDbLock`, no wait.)
-#   3. After all processes exit, zero leaked `gbrain_cycle_locks` rows remain.
+# Asserts the cross-process sync writer-lock contract:
+#   1. Exclusion + fail-fast: while the lock is held, N concurrent
+#      `gbrain sync` processes ALL fail fast with "Another sync is in
+#      progress" — none acquire, none queue/hang.
+#   2. Acquire-when-free: once the lock is released, a single sync acquires
+#      it, does its work, and completes.
+#   3. No leak: after every sync exits, zero `gbrain_cycle_locks` rows for
+#      the sync lock id remain (release via try/finally).
 #
-# Why the test matters: the eng-review-flagged v1 plan was wrong — the original
-# plan asserted the wrong semantics ("N-1 wait then complete one at a time")
-# and snapshot the wrong table (`pg_locks` instead of `gbrain_cycle_locks`).
-# Both reviewers caught it; this script tests the actual contract.
+# Lock id: the single-default-source CLI path (`gbrain sync --dir`, no
+# --source) takes the bare writer lock keyed `syncLockId('default')` =
+# 'gbrain-sync:default' (src/core/db-lock.ts + src/commands/sync.ts
+# performSync). v0.40.5.0 namespaced the lock per source; before that it was
+# the bare 'gbrain-sync' constant.
+#
+# Why we HOLD the lock instead of racing N processes for it: the original
+# "spawn N, expect exactly 1 winner" shape was timing-fragile. On a 2-page
+# brain the winner's sync finishes in well under the inter-process startup
+# stagger, so it releases the lock before the other processes reach the
+# acquire — they then acquire serially and you see 2+ "winners". That flaked
+# CI (got 2 winners, expected 1). Holding the lock externally for the whole
+# spawn window removes the race: exclusion is asserted deterministically.
 #
 # Postgres-only (no DATABASE_URL = graceful skip with hint).
 
@@ -56,7 +68,7 @@ timeout 180s bun run src/cli.ts doctor --json > /dev/null 2>>"$LOG"
 # call has something legitimate to do.
 BRAIN_DIR=$(mktemp -d -t gbrain-sync-lock-XXXXXX)
 # Compose with the earlier GBRAIN_HOME-cleanup trap (NOT overwrite it).
-trap 'rm -rf "$BRAIN_DIR" "$TMP_GBRAIN_HOME"; cp -f "$LOG" "$SURFACE_LOG" 2>/dev/null || true' EXIT
+trap 'psql "$DATABASE_URL" -c "DELETE FROM gbrain_cycle_locks WHERE id='"'"'gbrain-sync:default'"'"' AND holder_pid=999999" >/dev/null 2>&1 || true; rm -rf "$BRAIN_DIR" "$TMP_GBRAIN_HOME"; cp -f "$LOG" "$SURFACE_LOG" 2>/dev/null || true' EXIT
 
 # Seed two markdown pages so sync has real (but trivial) work
 mkdir -p "$BRAIN_DIR"
@@ -81,8 +93,18 @@ EOF
 # Tell gbrain to use this brain dir
 bun run src/cli.ts config set sync.repo_path "$BRAIN_DIR" >/dev/null 2>&1 || true
 
-# Step 3: spawn N parallel sync processes. Capture each one's exit code +
-# stdout/stderr. The race for the lock happens during their startup window.
+# The single-default-source CLI path takes this lock id (see header).
+LOCK_ID="gbrain-sync:default"
+SENTINEL_PID=999999
+
+# Step 3 (Part A — exclusion + fail-fast): hold the sync lock externally with
+# a far-future TTL, then spawn N concurrent syncs. With the lock held they
+# must ALL fail fast with "Another sync is in progress" — deterministic, no
+# race for who-wins.
+echo "[sync_lock_regression] holding $LOCK_ID externally (sentinel pid $SENTINEL_PID)..." | tee -a "$LOG"
+psql "$DATABASE_URL" -t -A -c "INSERT INTO gbrain_cycle_locks (id, holder_pid, holder_host, acquired_at, ttl_expires_at) VALUES ('$LOCK_ID', $SENTINEL_PID, 'sync-lock-regression-sentinel', NOW(), NOW() + interval '10 minutes') ON CONFLICT (id) DO UPDATE SET holder_pid = $SENTINEL_PID, holder_host = 'sync-lock-regression-sentinel', acquired_at = NOW(), ttl_expires_at = NOW() + interval '10 minutes';" >>"$LOG" 2>&1
+
+# Spawn N parallel sync processes. Capture each one's exit code + stdout/stderr.
 PIDS=()
 EXIT_FILES=()
 OUT_FILES=()
@@ -123,35 +145,57 @@ done
 # Cleanup tmp files
 rm -f "${EXIT_FILES[@]}" "${OUT_FILES[@]}"
 
-echo "[sync_lock_regression] outcomes: winners=$WINNERS losers=$LOSERS unknown=$UNKNOWN" | tee -a "$LOG"
+echo "[sync_lock_regression] outcomes (lock held): winners=$WINNERS losers=$LOSERS unknown=$UNKNOWN" | tee -a "$LOG"
 
-# Step 5: assert no leaked gbrain_cycle_locks rows. The pkey column is `id`,
-# not `lock_id` (column name confirmed via \d gbrain_cycle_locks).
-LEAKED=$(psql "$DATABASE_URL" -t -A -c "SELECT COUNT(*) FROM gbrain_cycle_locks WHERE id = 'gbrain-sync';" 2>>"$LOG" | tr -d ' ')
-echo "[sync_lock_regression] post-run gbrain_cycle_locks(gbrain-sync) row count: $LEAKED" | tee -a "$LOG"
+# Release the externally-held lock so a free sync can acquire it.
+echo "[sync_lock_regression] releasing externally-held $LOCK_ID..." | tee -a "$LOG"
+psql "$DATABASE_URL" -t -A -c "DELETE FROM gbrain_cycle_locks WHERE id = '$LOCK_ID' AND holder_pid = $SENTINEL_PID;" >>"$LOG" 2>&1
+
+# Step 4 (Part B — acquire-when-free + release): with the lock free, a single
+# sync must acquire it, do its work, and complete (rc=0). Proves the lock
+# isn't stuck-held and a legitimate sync still works.
+FREE_OUT=$(mktemp -t sync-lock-free-XXXXXX)
+( bun run src/cli.ts sync --dir "$BRAIN_DIR" >"$FREE_OUT" 2>&1 ); FREE_RC=$?
+if [ "$FREE_RC" = "0" ]; then
+  echo "[sync_lock_regression] free-lock sync: rc=0 (acquired + completed)" | tee -a "$LOG"
+else
+  echo "[sync_lock_regression] free-lock sync: rc=$FREE_RC (FAILED — see below)" | tee -a "$LOG"
+  head -5 "$FREE_OUT" 2>/dev/null | sed 's/^/    > /' | tee -a "$LOG"
+fi
+rm -f "$FREE_OUT"
+
+# Step 5: assert no leaked gbrain_cycle_locks rows for the sync lock id. The
+# pkey column is `id`, not `lock_id` (confirmed via \d gbrain_cycle_locks).
+LEAKED=$(psql "$DATABASE_URL" -t -A -c "SELECT COUNT(*) FROM gbrain_cycle_locks WHERE id = '$LOCK_ID';" 2>>"$LOG" | tr -d ' ')
+echo "[sync_lock_regression] post-run gbrain_cycle_locks($LOCK_ID) row count: $LEAKED" | tee -a "$LOG"
 
 # Step 6: verdict
 FAIL=0
 
-# We must see exactly one winner. Multiple winners means the lock isn't
-# enforcing exclusion; zero winners means every sync failed and we don't know
-# if the lock matters.
-if [ "$WINNERS" -ne 1 ]; then
-  echo "[sync_lock_regression] FAIL: expected 1 winner, got $WINNERS" >&2
+# Part A: while the lock was held, EVERY spawned sync must have failed fast
+# with the lock-busy message. A winner means mutual exclusion was breached
+# (a second sync acquired a lock another holder already had).
+if [ "$WINNERS" -ne 0 ]; then
+  echo "[sync_lock_regression] FAIL: lock was held — expected 0 winners, got $WINNERS (mutual exclusion breached)" >&2
   FAIL=1
 fi
 
-# We must see N-1 lock-busy losers — anything else means a sync failed for a
-# reason other than the lock (which would taint the measurement).
-EXPECTED_LOSERS=$((NUM_PARALLEL - 1))
-if [ "$LOSERS" -ne "$EXPECTED_LOSERS" ]; then
-  echo "[sync_lock_regression] FAIL: expected $EXPECTED_LOSERS lock-busy losers, got $LOSERS (unknown failures: $UNKNOWN)" >&2
+# All N must be lock-busy losers — anything else (an unknown failure) means a
+# sync exited for a reason other than the lock, which would taint the result.
+if [ "$LOSERS" -ne "$NUM_PARALLEL" ]; then
+  echo "[sync_lock_regression] FAIL: expected $NUM_PARALLEL lock-busy losers, got $LOSERS (unknown failures: $UNKNOWN)" >&2
+  FAIL=1
+fi
+
+# Part B: with the lock free, the single sync must have acquired and completed.
+if [ "$FREE_RC" != "0" ]; then
+  echo "[sync_lock_regression] FAIL: free-lock sync did not succeed (rc=$FREE_RC) — lock stuck-held or sync broken" >&2
   FAIL=1
 fi
 
 # The lock row must be cleaned up on exit (release via try/finally).
 if [ "$LEAKED" != "0" ]; then
-  echo "[sync_lock_regression] FAIL: $LEAKED leaked gbrain_cycle_locks(gbrain-sync) row(s) after all syncs exited" >&2
+  echo "[sync_lock_regression] FAIL: $LEAKED leaked gbrain_cycle_locks($LOCK_ID) row(s) after all syncs exited" >&2
   FAIL=1
 fi
 
@@ -160,4 +204,4 @@ if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
 
-echo "[sync_lock_regression] OK — 1 winner, $LOSERS lock-busy losers, no leaked lock rows."
+echo "[sync_lock_regression] OK — held lock blocked all $NUM_PARALLEL syncs (fail-fast), free-lock sync succeeded, no leaked lock rows."
