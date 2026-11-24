@@ -25,7 +25,8 @@
  * not one-time schema+backfill work.
  */
 
-import { execSync } from 'child_process';
+import { execSync } from '../../core/spawn.ts';
+import { gbrainChildCommand, runGbrainSubprocess } from './in-process.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts). The
 // orchestrator returns its result and the runner persists it.
@@ -37,17 +38,20 @@ import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhase
 // ~10s (ALTER + index builds). Bumped timeout accounts for slow Supabase
 // links (v0.12.1 pattern — migrations can time out on the 60s default).
 //
-// Shell out to the canonical `gbrain` shim on PATH (`/usr/local/bin/gbrain`
-// by default). An earlier revision resolved via the active Node/Bun runtime
-// binary, but on bun-installed trees that binary is `bun` — the spawned
-// `bun extract ...` gets reinterpreted as `bun run extract` and crashes the
-// upgrade mid-migration. The shim is already the canonical wrapper; trust
-// it. Regression guarded by test/migrations-v0_13_0.test.ts.
+// Children run the CLI that is running this migration (#5184,
+// gbrainChildCommand): the compiled executable, or bun plus the running
+// cli.ts, else the `gbrain` on PATH. An earlier revision spawned the bare
+// runtime binary, which on bun-installed trees is `bun` — `bun extract ...`
+// was reinterpreted as `bun run extract` and crashed the upgrade
+// mid-migration; resolveChildCliInvocation never returns bun without the
+// cli.ts entrypoint. Regression guarded by test/migrations-v0_13_0.test.ts
+// and test/migration-child-cli.test.ts.
 
-function phaseASchema(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
-    execSync('gbrain init --migrate-only', { stdio: 'inherit', timeout: 600_000, env: process.env });
+    const { runMigrateOnlyCore } = await import('./in-process.ts');
+    await runMigrateOnlyCore();
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -64,11 +68,7 @@ function phaseBBackfill(opts: OrchestratorOpts): OrchestratorPhaseResult {
     // `--include-frontmatter` is the v0.13 flag that enables the canonical
     // frontmatter link extractor. Default-OFF in the CLI for back-compat;
     // the migration explicitly opts in because this is the canonical backfill.
-    execSync('gbrain extract links --source db --include-frontmatter', {
-      stdio: 'inherit',
-      timeout: 1_800_000,  // 30 min hard cap; typical 2-5 min on 46K pages
-      env: process.env,
-    });
+    runGbrainSubprocess('gbrain extract links --source db --include-frontmatter', { timeoutMs: 1_800_000 });
     return { name: 'frontmatter_backfill', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -89,7 +89,7 @@ function phaseCVerify(opts: OrchestratorOpts): OrchestratorPhaseResult {
     // docs-only brains, and brains with no entity pages legitimately
     // produce 0. Phase B's own stdout shows `Links: created N` which is
     // the authoritative signal — user sees it during upgrade.
-    const out = execSync('gbrain call get_stats', {
+    const out = execSync(gbrainChildCommand('gbrain call get_stats'), {
       encoding: 'utf-8', timeout: 60_000, env: process.env,
     });
     const parsed = JSON.parse(out) as { link_count?: number; page_count?: number };
@@ -116,7 +116,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   const phases: OrchestratorPhaseResult[] = [];
 
-  const a = phaseASchema(opts);
+  const a = await phaseASchema(opts);
   phases.push(a);
   if (a.status === 'failed') return finalizeResult(phases, 'failed');
 
@@ -147,6 +147,7 @@ function finalizeResult(phases: OrchestratorPhaseResult[], status: 'complete' | 
 
 export const v0_13_0: Migration = {
   version: '0.13.0',
+  fresh_install_noop: true,
   featurePitch: {
     headline: 'Frontmatter becomes a graph — company, investors, attendees now create typed edges automatically',
     description:
@@ -160,11 +161,4 @@ export const v0_13_0: Migration = {
       'see exactly where the graph has holes.',
   },
   orchestrator,
-};
-
-/** Exported for unit tests. */
-export const __testing = {
-  phaseASchema,
-  phaseBBackfill,
-  phaseCVerify,
 };

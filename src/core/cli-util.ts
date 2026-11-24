@@ -1,16 +1,9 @@
 /**
- * Prompt on stdout, read one line from stdin, return trimmed string.
- * Shared helper used by interactive CLI flows (init, apply-migrations, etc.).
+ * Legacy home of the shared prompt helpers. They live in
+ * `src/core/interaction.ts` now (agent operator wave A5); these re-exports
+ * stay for one release with unchanged return contracts:
+ *   - promptLine(prompt): string (trimmed line; '' on EOF/timeout, no longer hangs)
+ *   - promptLineStderr(prompt, {timeoutMs}): string | null (null on EOF/timeout)
+ * New code: use readLine() from interaction.ts.
  */
-export function promptLine(prompt: string): Promise<string> {
-  return new Promise((resolve) => {
-    process.stdout.write(prompt);
-    process.stdin.setEncoding('utf-8');
-    process.stdin.once('data', (chunk) => {
-      const data = chunk.toString().trim();
-      process.stdin.pause();
-      resolve(data);
-    });
-    process.stdin.resume();
-  });
-}
+export { promptLine, promptLineStderr } from './interaction.ts';

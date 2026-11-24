@@ -20,19 +20,21 @@
  *   D. Record   — append completed.jsonl.
  */
 
-import { execSync } from 'child_process';
+import { execSync } from '../../core/spawn.ts';
+import { gbrainChildCommand, runGbrainSubprocess } from './in-process.ts';
 import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhaseResult } from './types.ts';
 import { childGlobalFlags } from '../../core/cli-options.ts';
 // Bug 3 — ledger writes moved to the runner (apply-migrations.ts).
 
 // ── Phase A — Schema ────────────────────────────────────────
 
-function phaseASchema(opts: OrchestratorOpts): OrchestratorPhaseResult {
+async function phaseASchema(opts: OrchestratorOpts): Promise<OrchestratorPhaseResult> {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
   try {
     // Propagate global progress flags so the child shows the same mode the
     // parent orchestrator is running in.
-    execSync('gbrain init --migrate-only' + childGlobalFlags(), { stdio: 'inherit', timeout: 60_000, env: process.env });
+    const { runMigrateOnlyCore } = await import('./in-process.ts');
+    await runMigrateOnlyCore();
     return { name: 'schema', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -46,7 +48,7 @@ function phaseBRepair(opts: OrchestratorOpts): OrchestratorPhaseResult {
   if (opts.dryRun) return { name: 'jsonb_repair', status: 'skipped', detail: 'dry-run' };
   try {
     // stdio: 'inherit' — child's stderr progress streams straight through.
-    execSync('gbrain repair-jsonb' + childGlobalFlags(), { stdio: 'inherit', timeout: 600_000, env: process.env });
+    runGbrainSubprocess('gbrain repair-jsonb' + childGlobalFlags(), { timeoutMs: 600_000 });
     return { name: 'jsonb_repair', status: 'complete' };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -64,7 +66,7 @@ function phaseCVerify(opts: OrchestratorOpts): OrchestratorPhaseResult {
     // Any accidental stdout progress from the child would break JSON.parse
     // (per Codex review #12). NOTE: we deliberately do NOT pass
     // --progress-json here — this child is parsed, not watched.
-    const out = execSync('gbrain repair-jsonb --dry-run --json', {
+    const out = execSync(gbrainChildCommand('gbrain repair-jsonb --dry-run --json'), {
       encoding: 'utf-8', timeout: 60_000, env: process.env,
       stdio: ['ignore', 'pipe', 'inherit'],
     });
@@ -94,7 +96,7 @@ async function orchestrator(opts: OrchestratorOpts): Promise<OrchestratorResult>
 
   const phases: OrchestratorPhaseResult[] = [];
 
-  const a = phaseASchema(opts);
+  const a = await phaseASchema(opts);
   phases.push(a);
   if (a.status === 'failed') return finalizeResult(phases, 'failed');
 
@@ -123,6 +125,7 @@ function finalizeResult(phases: OrchestratorPhaseResult[], status: 'complete' | 
 
 export const v0_12_2: Migration = {
   version: '0.12.2',
+  fresh_install_noop: true,
   featurePitch: {
     headline: 'Postgres frontmatter queries now work — JSONB double-encode bug fixed and existing rows auto-repaired',
     description:
@@ -134,11 +137,4 @@ export const v0_12_2: Migration = {
       'truncated by the splitBody horizontal-rule bug can be recovered with `gbrain sync --full`.',
   },
   orchestrator,
-};
-
-/** Exported for unit tests. */
-export const __testing = {
-  phaseASchema,
-  phaseBRepair,
-  phaseCVerify,
 };

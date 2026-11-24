@@ -14,11 +14,27 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runReindexCode } from '../src/commands/reindex-code.ts';
+import { configureGateway, resetGateway } from '../src/core/ai/gateway.ts';
+import { MARKDOWN_CHUNKER_VERSION } from '../src/core/chunkers/recursive.ts';
 
 describe('Layer 13 E2 — runReindexCode', () => {
   let engine: PGLiteEngine;
+  let prevNudgeEnv: string | undefined;
 
   beforeAll(async () => {
+    // v0.37.3 — runReindexCode now reads getEmbeddingModelName() from the
+    // gateway for both the cost-preview model field and the code-model
+    // nudge. Configure the gateway with the historical default so the
+    // existing model-name assertion stays exact, and suppress the nudge
+    // so test stderr stays clean.
+    prevNudgeEnv = process.env.GBRAIN_NO_CODE_MODEL_NUDGE;
+    process.env.GBRAIN_NO_CODE_MODEL_NUDGE = '1';
+    configureGateway({
+      embedding_model: 'openai:text-embedding-3-large',
+      embedding_dimensions: 1536,
+      env: { OPENAI_API_KEY: 'sk-test' },
+    });
+
     engine = new PGLiteEngine();
     await engine.connect({});
     await engine.initSchema();
@@ -63,6 +79,9 @@ describe('Layer 13 E2 — runReindexCode', () => {
 
   afterAll(async () => {
     await engine.disconnect();
+    resetGateway();
+    if (prevNudgeEnv === undefined) delete process.env.GBRAIN_NO_CODE_MODEL_NUDGE;
+    else process.env.GBRAIN_NO_CODE_MODEL_NUDGE = prevNudgeEnv;
   }, 30_000);
 
   test('counts code pages, ignores markdown', async () => {
@@ -109,5 +128,29 @@ describe('Layer 13 E2 — runReindexCode', () => {
       batchSize: 1,
     });
     expect(result.codePages).toBe(3);
+  });
+
+  test('forced CPU-only code rebuild removes legacy private fragments and restores sealed public chunks', async () => {
+    const sourceId = 'code-seal-example';
+    const slug = 'src-protected-example-ts';
+    await engine.executeRaw('INSERT INTO sources (id, name) VALUES ($1, $1)', [sourceId]);
+    try {
+      const body = "export const publicExample = 'publiccodeseal';\n<!--- gbrain:takes:begin -->\nexport const hiddenExample = 'PRIVATE_CODE_CANARY';\n<!--- gbrain:takes:end -->";
+      const page = await engine.putPage(slug, {
+        type: 'code', page_kind: 'code', title: 'src/protected-example.ts', compiled_truth: body,
+        frontmatter: { language: 'typescript', file: 'src/protected-example.ts' },
+      }, { sourceId });
+      await engine.upsertChunks(slug, [{ chunk_index: 0, chunk_source: 'compiled_truth', chunk_text: 'PRIVATE_CODE_CANARY' }], { sourceId });
+      expect(await engine.getChunks(slug, { sourceId, requireSafeChunks: true })).toEqual([]);
+      const result = await runReindexCode(engine, { sourceId, force: true, noEmbed: true });
+      expect(result).toMatchObject({ reindexed: 1, failed: 0 });
+      const [version] = await engine.executeRaw<{ chunker_version: number }>('SELECT chunker_version FROM pages WHERE id = $1', [page.id]);
+      expect(Number(version.chunker_version)).toBe(MARKDOWN_CHUNKER_VERSION);
+      const chunks = await engine.getChunks(slug, { sourceId, requireSafeChunks: true });
+      expect(chunks.length).toBeGreaterThan(0);
+      expect(JSON.stringify(chunks)).toContain('publiccodeseal');
+      expect(JSON.stringify(chunks)).not.toContain('PRIVATE_CODE_CANARY');
+      expect(chunks.every(chunk => chunk.embedding_is_null)).toBe(true);
+    } finally { await engine.executeRaw('DELETE FROM sources WHERE id = $1', [sourceId]); }
   });
 });

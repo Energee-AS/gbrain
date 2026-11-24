@@ -15,8 +15,9 @@
  *     of skills this intent is allowed to also match).
  *
  *   Layer B (LLM tie-break, optional): only runs via `gbrain routing-eval
- *     --llm`. Not yet implemented in v0.17 core; the CLI stubs the flag
- *     so call sites are ready.
+ *     --llm`. Not yet implemented in this release; the CLI accepts the
+ *     flag (emits a stderr notice and runs Layer A only) so call sites
+ *     are ready. A future release will wire up the tie-break layer.
  *
  * Fixture linter (D-CX-6): we reject fixtures where the normalized
  * `intent` is a verbatim substring of any trigger phrase attached to
@@ -83,7 +84,7 @@ export interface RoutingCaseResult {
 /**
  * Normalize a string for routing comparison:
  *   - lowercase
- *   - replace any non-alphanumeric char with a space
+ *   - replace any non-letter/mark/number char with a space
  *   - collapse whitespace
  *   - trim
  *
@@ -93,9 +94,18 @@ export interface RoutingCaseResult {
  * a routing match should do. The cost is slightly over-permissive
  * matching; the benefit is reliable matches across quote/punctuation
  * variants that agents emit in practice.
+ *
+ * The character class is `\p{L}\p{M}\p{N}` (any Unicode letter, combining
+ * mark, or number) under the `u` flag, not `a-z0-9`. An ASCII-only class
+ * silently drops every non-Latin script — Korean, Chinese, Japanese,
+ * Cyrillic all collapse to an empty string, so a skill with only
+ * non-English triggers can never match any intent through this checker.
+ * `\p{M}` keeps abugida vowel signs and viramas (Devanagari, Thai) and
+ * NFD-decomposed accents attached to their base letter.
  */
 export function normalizeText(s: string): string {
-  return s.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+  if (!s) return '';
+  return s.toLowerCase().replace(/[^\p{L}\p{M}\p{N}]+/gu, ' ').trim();
 }
 
 /**
@@ -297,6 +307,10 @@ export function loadRoutingFixtures(skillsDir: string): LoadResult {
       if (raw.startsWith('//') || raw.startsWith('#')) continue;
       try {
         const obj = JSON.parse(raw) as RoutingFixture;
+        if (typeof obj.intent !== 'string') {
+          malformed.push({ file: fixturePath, line: i + 1, raw, error: `missing required field 'intent' (found keys: ${Object.keys(obj).join(', ')})` });
+          continue;
+        }
         fixtures.push({ ...obj, source: fixturePath });
       } catch (err) {
         malformed.push({
@@ -316,7 +330,7 @@ export function loadRoutingFixtures(skillsDir: string): LoadResult {
 // ---------------------------------------------------------------------------
 
 export interface RunRoutingEvalOptions {
-  /** Reserved for Layer B (LLM tie-break). Not implemented in v0.17. */
+  /** Reserved for Layer B (LLM tie-break). Not implemented in this release. */
   llm?: boolean;
 }
 

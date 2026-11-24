@@ -11,6 +11,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
 import { dirname, join } from 'path';
+import { assertLegacySkillFilesystemWrite } from '../skillpack/writer-guard.ts';
 
 import {
   resolverRow,
@@ -116,9 +117,16 @@ export function planScaffold(opts: ScaffoldOptions): ScaffoldPlan {
 }
 
 /**
- * Check whether the resolver already has a backtick-wrapped reference
- * to `skills/<name>/SKILL.md`. Idempotency contract (D-CX-7) — if
- * present, we never re-append a row for this skill, even with --force.
+ * Check whether the resolver already references `skills/<name>/SKILL.md`
+ * in ANY form: backticked (`skills/foo/SKILL.md`), single-quoted
+ * ('skills/foo/SKILL.md'), double-quoted ("skills/foo/SKILL.md"), or
+ * bare (skills/foo/SKILL.md surrounded by non-word chars).
+ *
+ * Idempotency contract — if any form is present, we never re-append a
+ * row for this skill, even with --force. This is broader than the
+ * original backtick-only match: users who hand-edit the resolver to
+ * normalize formatting (drop backticks, use quotes, etc.) should not
+ * cause duplicate rows on the next scaffold --force.
  */
 function detectExistingResolverRow(resolverFile: string, name: string): boolean {
   let content: string;
@@ -128,7 +136,15 @@ function detectExistingResolverRow(resolverFile: string, name: string): boolean 
     return false;
   }
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`\`skills\\/${escaped}\\/SKILL\\.md\``);
+  // Match the path with any common delimiter on either side: backtick,
+  // single quote, double quote, parenthesis, whitespace, start/end of
+  // line. The `(?:^|...)` and `(?:$|...)` anchors ensure we don't
+  // false-match on something like "skills/foo-bar/SKILL.md" when
+  // looking for "foo".
+  const re = new RegExp(
+    `(?:^|[\`'"\\s\\(\\[])skills\\/${escaped}\\/SKILL\\.md(?:[\`'"\\s\\)\\]]|$)`,
+    'm',
+  );
   return re.test(content);
 }
 
@@ -162,7 +178,10 @@ function buildResolverAppend(resolverFile: string, vars: ScaffoldVars): string {
  * and just render the plan.
  */
 export function applyScaffold(plan: ScaffoldPlan): void {
+  for (const f of plan.files) assertLegacySkillFilesystemWrite(f.path);
+  if (plan.resolverFile && plan.resolverAppend !== null) assertLegacySkillFilesystemWrite(plan.resolverFile);
   for (const f of plan.files) {
+    assertLegacySkillFilesystemWrite(f.path);
     mkdirSync(dirname(f.path), { recursive: true });
     writeFileSync(f.path, f.content);
   }
@@ -170,6 +189,7 @@ export function applyScaffold(plan: ScaffoldPlan): void {
     const current = existsSync(plan.resolverFile)
       ? readFileSync(plan.resolverFile, 'utf-8')
       : '';
+    assertLegacySkillFilesystemWrite(plan.resolverFile);
     writeFileSync(plan.resolverFile, current + plan.resolverAppend);
   }
 }

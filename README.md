@@ -1,714 +1,430 @@
-# GBrain
+<h1><picture><source media="(prefers-color-scheme: dark)" srcset="docs/images/brand/gbrain-wordmark-light.svg"><img src="docs/images/brand/gbrain-wordmark.svg" alt="GBrain" height="52"></picture></h1>
 
-Your AI agent is smart but forgetful. GBrain gives it a brain.
+**One brain for you and your company, read by every agent you use.** Put your own notes and your company's docs in one place: a facts page, a decisions log, call transcripts. Claude Code, Codex and your other agents look there before they answer, so they stop starting from zero and work from what you and your team actually wrote down.
 
-Built by the President and CEO of Y Combinator to run his actual AI agents. The production brain powering his OpenClaw and Hermes deployments: **17,888 pages, 4,383 people, 723 companies**, 21 cron jobs running autonomously, built in 12 days. The agent ingests meetings, emails, tweets, voice calls, and original ideas while you sleep. It enriches every person and company it encounters. It fixes its own citations and consolidates memory overnight. You wake up and the brain is smarter than when you went to bed.
+GBrain is MIT-licensed and free to self-host, and it starts with no API keys: search is by keyword until you add one. gbrain.io is optional paid hosting.
 
-The brain wires itself. Every page write extracts entity references and creates typed links (`attended`, `works_at`, `invested_in`, `founded`, `advises`) with zero LLM calls. Hybrid search. Self-wiring knowledge graph. Structured timeline. Backlink-boosted ranking. Ask "who works at Acme AI?" or "what did Bob invest in this quarter?" and get answers vector search alone can't reach. Benchmarked side-by-side against the category: gbrain lands **P@5 49.1%, R@5 97.9%** on a 240-page Opus-generated rich-prose corpus, beating its own graph-disabled variant by **+31.4 points P@5** and ripgrep-BM25 + vector-only RAG by a similar margin. The graph layer plus v0.12 extract quality together carry the gap. Full BrainBench scorecards + corpus live in the sibling [gbrain-evals](https://github.com/garrytan/gbrain-evals) repo.
+> [!TIP]
+> **Need hosted? First time running an agent?** Try **[gbrain.io](https://gbrain.io/?ref=readme)**, hosted GBrain, for the easiest experience: one brain for you and your team, connected to ChatGPT, Claude and Cursor, with nothing to install or keep online. Stuck? Email support@gbrain.io and a person will set it up with you, free.
 
-GBrain is those patterns, generalized. 29 skills. Install in 30 minutes. Your agent does the work. As Garry's personal agent gets smarter, so does yours.
+**A few minutes after you install it:**
 
-> **~30 minutes to a fully working brain.** Database ready in 2 seconds (PGLite, no server). You just answer questions about API keys.
+- Every new Claude Code or Codex session looks in your brain before it answers, without being told to.
+- Anything you ask your agent to remember is still there in the next session, in every agent connected to the brain.
+- Your notes and your company's docs are searchable, and your agent answers questions like *"what did we decide about pricing, and why?"* from them.
 
-> **LLMs:** fetch [`llms.txt`](llms.txt) for the documentation map, or [`llms-full.txt`](llms-full.txt) for the same map with core docs inlined in one fetch. **Agents:** start with [`AGENTS.md`](AGENTS.md) (or [`CLAUDE.md`](CLAUDE.md) if you're Claude Code).
+**Works with these agents** (each name links to its guide):
+
+| How it connects | Agents |
+|---|---|
+| One command wires memory, hooks and instructions | [Claude Code](docs/mcp/CLAUDE_CODE.md) (`gbrain setup claude-code`), [Codex](docs/mcp/CODEX.md) (`gbrain setup codex`) |
+| `gbrain setup hermes` registers MCP through Hermes's own CLI and adds the brain-first instructions | [Hermes](#hermes) |
+| MCP from its guide, then `gbrain setup <name>` adds the brain-first instructions | [OpenClaw](docs/mcp/OPENCLAW.md), [opencode](docs/mcp/OPENCODE.md), [Cursor](#connect-gbrain-to-your-ai-client-mcp) |
+| MCP from its guide | [ChatGPT](docs/mcp/CHATGPT.md), [Claude Desktop](docs/mcp/CLAUDE_DESKTOP.md), [Claude Cowork](docs/mcp/CLAUDE_COWORK.md), [Perplexity](docs/mcp/PERPLEXITY.md), [Grok Build](docs/mcp/GROK.md), [Grok Bot](docs/guides/grok-bot.md), [Muse](docs/guides/muse.md), [Windsurf and other stdio clients](#connect-gbrain-to-your-ai-client-mcp) |
+| Any other coding agent | Paste the [install prompt](#heres-how-to-self-host-it) below |
+
+## Stability
+
+New releases come out many times a day, but the install command below gives you the **stable channel**: a release reaches it only after the full test suite and a two-hour, 600,000-page load test pass on that exact release, and only when an important fix is waiting or stable is a week old. Updates are never installed without your say-so unless you turn on automatic upgrades. After an upgrade, gbrain shows a one-time notice listing what changed in behaviour. Stable also comes with a written promise about which commands, flags, tools, config keys and output fields stay the same, and how much warning you get before one changes. [docs/STABILITY.md](docs/STABILITY.md) explains that promise, how often stable moves, how to pin a version or go back, and what the faster alpha channel is for.
 
 ## Install
 
-### On an agent platform (recommended)
+> [!TIP]
+> **Fastest: hosted GBrain at [gbrain.io](https://gbrain.io/cli?ref=readme), for any harness.** One command launches a GBrain hosted on gbrain.io; Claude Code, Codex, ChatGPT, Cursor and every other AI you use connect to it, with nothing to keep online.
+>
+> ```bash
+> curl -sSL https://gbrainio.terminalwire.sh | bash
+> gbrainio terminal connect      # in a new terminal
+> gbrainio workspace new         # pick a plan in the browser
+> curl -fsSL https://bun.sh/install | bash   # skip if Bun 1.4.4+ is installed
+> export PATH="$HOME/.bun/bin:$PATH"
+> bun install -g github:garrytan/gbrain#stable   # the gbrain CLI only; no local brain
+> # Claude Code (an existing gbrain entry is kept):
+> (claude mcp get gbrain >/dev/null 2>&1 || claude mcp add --transport http --scope user gbrain https://gbrain.io/mcp) && gbrain setup claude-code --instructions-only
+> # Codex (an existing gbrain entry is kept):
+> (codex mcp get gbrain >/dev/null 2>&1 || codex mcp add gbrain --url https://gbrain.io/mcp) && gbrain setup codex --instructions-only
+> ```
+>
+> Bun's installer needs `unzip` and stops with `error: unzip is required to install bun` without it. Check with `command -v unzip`; if it prints nothing, install it first: `apt-get update && apt-get install -y unzip` (Debian, Ubuntu), `dnf install -y unzip` (Fedora, RHEL) or `apk add unzip` (Alpine), with `sudo` in front unless you are root. No way to install packages? Use the [no-unzip route](INSTALL_FOR_AGENTS.md#no-unzip), not an improvised one. A command scanner (Hermes) refuses the Bun installer or `bun install -g`? Use the [release binary route](INSTALL_FOR_AGENTS.md#release-binary).
+>
+> `gbrain setup <harness> --instructions-only` tells the agent the brain is there; agents seldom call an MCP server nobody told them about. It writes the [brain-first block](docs/guides/setup.md#brain-first-instructions) into `~/.claude/CLAUDE.md` or Codex's `AGENTS.md` (a non-empty `AGENTS.override.md` instead when Codex has one) with a per-turn rule hook, and leaves the MCP entry alone; the same command with `--no-instructions` added takes them out.
+>
+> The installer is a shell script for macOS and Linux; read it before you run it.
 
-GBrain is designed to be installed and operated by an AI agent. If you don't have one running yet:
+### Here's how to self-host it
 
-- **[OpenClaw](https://openclaw.ai)** ... Deploy [AlphaClaw on Render](https://render.com/deploy?repo=https://github.com/chrysb/alphaclaw) (one click, 8GB+ RAM)
-- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** ... Deploy on [Railway](https://github.com/praveen-ks-2001/hermes-agent-template) (one click)
+GBrain is MIT-licensed and free to self-host. It needs **Bun 1.4.4 or newer**; existing worker installs read the [authorization and queue upgrade guide](docs/guides/authorization-upgrade.md) before restarting on this version.
 
-Paste this into your agent:
+> [!WARNING]
+> **GBrain is NOT distributed on npm.** The npm `gbrain` package is unrelated and
+> can shadow the real binary, so never run `npm install -g gbrain` or
+> `bun add -g gbrain`. Install only via `bun install -g github:garrytan/gbrain#stable`
+> (the soaked stable channel; `#latest-stable` is the alpha line with every release)
+> or `git clone --branch stable` + `bun install && bun link`. Installed by mistake? `gbrain doctor` gives the fix.
+> Schema not migrated ([#218](https://github.com/garrytan/gbrain/issues/218))? Run
+> `gbrain apply-migrations --yes --no-autopilot-install`; if it exits 1, run `gbrain doctor --json`, not another `--yes` (`wedged`: relay its fix).
 
+```bash
+bun install -g github:garrytan/gbrain#stable
+gbrain setup claude-code              # or: gbrain setup codex
+gbrain init --pglite --no-embedding   # any other harness, or no agent
 ```
-Retrieve and follow the instructions at:
+
+`gbrain setup` shows what it will write first (`--dry-run` previews, `--remove` undoes), creates a keyless brain only if none exists, wires MCP, hooks and a brain-first block in the agent's instruction file (`--no-instructions` skips it), and smoke-tests them ([setup guide](docs/guides/setup.md)). For any other coding agent, paste:
+
+```text
+Add GBrain memory to this existing agent. Read and follow:
 https://raw.githubusercontent.com/garrytan/gbrain/master/INSTALL_FOR_AGENTS.md
+Keep my current identity and instructions, start keyless, and show me the
+search-mode choice. Verify a remember/recall round trip with real GBrain calls.
 ```
 
-That's it. The agent clones the repo, installs GBrain, sets up the brain, loads 29 skills, and configures recurring jobs. You answer a few questions about API keys. ~30 minutes.
+### Hermes
 
-If your agent doesn't auto-read `AGENTS.md`, point it at that file first:
-`https://raw.githubusercontent.com/garrytan/gbrain/master/AGENTS.md` is the non-Claude
-agent operating protocol (install, read order, trust boundary, common tasks). For
-the full doc map, use `llms.txt` at the same URL root.
-
-### Standalone CLI (no agent)
+Hermes checks every shell command before it runs it, and with nobody there to approve (`hermes chat -q`, a gateway or cron run) it refuses the Bun installer and `bun install -g`. Install the release binary instead, one file that needs no Bun and no package install, and let setup register it through Hermes's own `hermes mcp add`. Run each line as its own command (Linux x64; on an Apple Silicon Mac use `gbrain-darwin-arm64`):
 
 ```bash
-git clone https://github.com/garrytan/gbrain.git && cd gbrain && bun install && bun link
-gbrain init                     # local brain, ready in 2 seconds
-gbrain import ~/notes/          # index your markdown
-gbrain query "what themes show up across my notes?"
+curl -fL --create-dirs -o ~/.local/bin/gbrain https://github.com/garrytan/gbrain/releases/latest/download/gbrain-linux-x64
+chmod +x ~/.local/bin/gbrain
+~/.local/bin/gbrain init --pglite --no-embedding
+~/.local/bin/gbrain setup hermes
 ```
 
-**Do NOT use `bun install -g github:garrytan/gbrain`.** Bun blocks the top-level
-postinstall hook on global installs, so schema migrations never run and the CLI
-aborts with `Aborted()` the first time it opens PGLite. Use `git clone + bun install
-&& bun link` as shown above. See [#218](https://github.com/garrytan/gbrain/issues/218).
+Then start a new Hermes session. Setup registers the MCP server (`hermes mcp test gbrain` checks it) and adds the brain-first rule to `~/.hermes/SOUL.md` with a per-turn hook. Hermes's approval and command-scanner settings stay as they are; setup only records the approval for its own per-turn hook. If setup prints a `hermes mcp add` command instead of registering, run that command as printed. To paste it to Hermes instead, use the prompt above. Details: [docs/mcp/HERMES.md](docs/mcp/HERMES.md).
 
-```
-3 results (hybrid search, 0.12s):
+Postgres, thin clients, API keys and upgrades: [docs/INSTALL.md](docs/INSTALL.md). Agents: [INSTALL_FOR_AGENTS.md](INSTALL_FOR_AGENTS.md). Memory-only walkthrough: [give your coding agent a memory](docs/tutorials/connect-coding-agent.md).
 
-1. concepts/do-things-that-dont-scale (score: 0.94)
-   PG's argument that unscalable effort teaches you what users want.
-   [Source: paulgraham.com, 2013-07-01]
+### Add your notes and your company's docs
 
-2. originals/founder-mode-observation (score: 0.87)
-   Deep involvement isn't micromanagement if it expands the team's thinking.
-
-3. concepts/build-something-people-want (score: 0.81)
-   The YC motto. Connected to 12 other brain pages.
-```
-
-### MCP server (Claude Code, Cursor, Windsurf)
-
-GBrain exposes 30+ MCP tools via stdio:
-
-```json
-{
-  "mcpServers": {
-    "gbrain": { "command": "gbrain", "args": ["serve"] }
-  }
-}
-```
-
-Add to `~/.claude/server.json` (Claude Code), Settings > MCP Servers (Cursor), or your client's MCP config.
-
-### Remote MCP (Claude Desktop, Cowork, Perplexity)
+Point GBrain at two folders of Markdown files: your own notes (an Obsidian vault works) and your company's docs. In the company folder, keep `facts.md` (numbers and statements agents may repeat), `decisions.md` (each decision with its date, its reason and who made it) and call transcripts saved as `.md` files.
 
 ```bash
-gbrain auth create "claude-desktop"            # tokens via the existing CLI
-gbrain serve --http --port 8787                 # built-in HTTP transport (Postgres-only)
-ngrok http 8787 --url your-brain.ngrok.app      # any tunnel works
-claude mcp add gbrain -t http https://your-brain.ngrok.app/mcp -H "Authorization: Bearer TOKEN"
+gbrain sources add notes --path ~/notes --federated --force      # your notes
+gbrain sources add company --path ~/company --federated --force  # company docs
+gbrain sync --all                                                # rerun after edits
 ```
 
-Per-client guides: [`docs/mcp/`](docs/mcp/DEPLOY.md). Hardening defaults, env vars, and threat model: [SECURITY.md](SECURITY.md). ChatGPT requires OAuth 2.1 (not yet implemented).
+Then open a new agent session and ask *"What did we decide about a free plan, and why?"*: the answer comes from your decisions log. `--federated` puts the folder in default search, and `--force` accepts a folder that isn't a git repository; in a folder that is one, GBrain reads only committed files, so commit your edits before you sync. To see the shape first, `gbrain sources demo company-brain` runs a fictional company in a few seconds without touching your brain. Before you share a company brain with a team, read the [company-brain tutorial](docs/tutorials/company-brain.md).
 
-### Using gbrain with GStack
+GBrain is not a data warehouse or analytics store. Keep ads, analytics, CRM and payment data in your warehouse, and connect your agent to it separately.
 
-If your engineering agent runs on [GStack](https://github.com/garrytan/gstack), point it at gbrain for code lookup instead of grep+read. Cathedral II (v0.21.0) ships call-graph edges and two-pass retrieval — `/investigate`, `/review`, `/plan-eng-review`, and `/office-hours` all benefit when the agent walks the symbol graph instead of scanning files line by line.
-
-The five magical-moment commands:
+### CLI standalone (no agent)
 
 ```bash
-gbrain code-callers searchKeyword           # who calls this symbol?
-gbrain code-callees searchKeyword           # what does this symbol call?
-gbrain code-def BrainEngine                 # where is X defined?
-gbrain code-refs BrainEngine                # all reference sites
-gbrain query "how does N+1 handling work" --near-symbol BrainEngine.searchKeyword --walk-depth 2
+gbrain init --pglite --no-embedding   # keyless; no server, no Docker
+gbrain import ~/notes/ --no-embed     # index your markdown
+gbrain search "a phrase from a note" --json
+gbrain doctor                         # verify health
 ```
 
-All five auto-emit JSON on non-TTY (gh-CLI convention) so a GStack subagent shelling out via bash gets a clean parseable response. Run `gbrain sources add <repo> --strategy code` to index a repo, then your agent's brain-first lookup covers code, not just markdown. ([Cathedral II release notes](CHANGELOG.md#0210---2026-04-25))
+### Optional: a new personal agent
 
-## The 29 Skills
-
-GBrain ships 29 skills organized by `skills/RESOLVER.md` (or your OpenClaw's `AGENTS.md` — both filenames are supported as of v0.19). The resolver tells your agent which skill to read for any task.
-
-[Skill files are code.](https://x.com/garrytan/status/2042925773300908103) They're the most powerful way to get knowledge work done. A skill file is a fat markdown document that encodes an entire workflow: when to fire, what to check, how to chain with other skills, what quality bar to enforce. The agent reads the skill and executes it. Skills can also call deterministic TypeScript code bundled in GBrain (search, import, embed, sync) for the parts that shouldn't be left to LLM judgment. [Thin harness, fat skills](docs/ethos/THIN_HARNESS_FAT_SKILLS.md): the intelligence lives in the skills, not the runtime.
-
-### Always-on
-
-| Skill | What it does |
-|-------|-------------|
-| **signal-detector** | Fires on every message. Spawns a cheap model in parallel to capture original thinking and entity mentions. The brain compounds on autopilot. |
-| **brain-ops** | Brain-first lookup before any external API. The read-enrich-write loop that makes every response smarter. |
-
-### Content ingestion
-
-| Skill | What it does |
-|-------|-------------|
-| **ingest** | Thin router. Detects input type and delegates to the right ingestion skill. |
-| **idea-ingest** | Links, articles, tweets become brain pages with analysis, author people pages, and cross-linking. |
-| **media-ingest** | Video, audio, PDF, books, screenshots, GitHub repos. Transcripts, entity extraction, backlink propagation. |
-| **meeting-ingestion** | Transcripts become brain pages. Every attendee gets enriched. Every company gets a timeline entry. |
-
-### Brain operations
-
-| Skill | What it does |
-|-------|-------------|
-| **enrich** | Tiered enrichment (Tier 1/2/3). Creates and updates person/company pages with compiled truth and timelines. |
-| **query** | 3-layer search with synthesis and citations. Says "the brain doesn't have info on X" instead of hallucinating. |
-| **maintain** | Periodic health: stale pages, orphans, dead links, citation audit, back-link enforcement, tag consistency. |
-| **citation-fixer** | Scans pages for missing or malformed citations. Fixes format to match the standard. |
-| **repo-architecture** | Where new brain files go. Decision protocol: primary subject determines directory, not format. |
-| **publish** | Share brain pages as password-protected HTML. Zero LLM calls. |
-| **data-research** | Structured data research with parameterized YAML recipes. Extract investor updates, expenses, company metrics from email. |
-
-### Operational
-
-| Skill | What it does |
-|-------|-------------|
-| **daily-task-manager** | Task lifecycle with priority levels (P0-P3). Stored as searchable brain pages. |
-| **daily-task-prep** | Morning prep: calendar lookahead with brain context per attendee, open threads, task review. |
-| **cron-scheduler** | Schedule staggering (5-min offsets), quiet hours (timezone-aware with wake-up override), idempotency. |
-| **reports** | Timestamped reports with keyword routing. "What's the latest briefing?" finds it instantly. |
-| **cross-modal-review** | Quality gate via second model. Refusal routing: if one model refuses, silently switch. |
-| **webhook-transforms** | External events (SMS, meetings, social mentions) converted into brain pages with entity extraction. |
-| **testing** | Validates every skill has SKILL.md with frontmatter, manifest coverage, resolver coverage. |
-| **skill-creator** | Create new skills following the conformance standard. MECE check against existing skills. |
-| **skillify** | The "skillify it!" meta-skill. Orchestrates the 10-step loop so failures become durable skills: scaffold the stubs via `gbrain skillify scaffold`, write the real logic, gate with `gbrain skillify check` + `gbrain check-resolvable`. |
-| **skillpack-check** | Agent-readable gbrain health report. Exit code for CI; JSON for debugging. Cron-friendly. |
-| **smoke-test** | 8 post-restart health checks with auto-fix (Bun, CLI, DB, worker, Zod CJS, gateway, API key, brain repo). Drop-in user tests at `~/.gbrain/smoke-tests.d/*.sh`. |
-| **minion-orchestrator** | Background work in one skill. Shell jobs via `gbrain jobs submit shell` (operator/CLI, MCP blocks protected names) and LLM subagents via `gbrain agent run`. Parent-child DAGs, `child_done` inbox, durability across worker restarts. |
-
-### Identity and setup
-
-| Skill | What it does |
-|-------|-------------|
-| **soul-audit** | 6-phase interview generating SOUL.md (agent identity), USER.md (user profile), ACCESS_POLICY.md (4-tier privacy), HEARTBEAT.md (operational cadence). |
-| **setup** | Auto-provision PGLite or Supabase. First import. GStack detection. |
-| **migrate** | Universal migration from Obsidian, Notion, Logseq, markdown, CSV, JSON, Roam. |
-| **briefing** | Daily briefing with meeting context, active deals, and citation tracking. |
-
-### Conventions
-
-Cross-cutting rules in `skills/conventions/`:
-- **quality.md** ... citations, back-links, notability gate, source attribution
-- **brain-first.md** ... 5-step lookup before any external API call
-- **model-routing.md** ... which model for which task
-- **test-before-bulk.md** ... test 3-5 items before any batch operation
-- **cross-modal.yaml** ... review pairs and refusal routing chain
-
-## How It Works
+To have GBrain create a **new persistent personal agent** with identity files and its own private GitHub repo, open Codex (CLI or ChatGPT desktop) or Claude Code in a new, empty folder and paste:
 
 ```
-Signal arrives (meeting, email, tweet, link)
-  -> Signal detector captures ideas + entities (parallel, never blocks)
-  -> Brain-ops: check the brain first (gbrain search, gbrain get)
-  -> Respond with full context
-  -> Write: update brain pages with new information + citations
-  -> Auto-link: typed relationships extracted on every write (zero LLM calls)
-  -> Sync: gbrain indexes changes for next query
+Read and follow every step of:
+https://raw.githubusercontent.com/garrytan/gbrain/stable/BOOTSTRAP_FOR_AGENTS.md
+Goal: set yourself up as my persistent personal agent in this folder, with gbrain
+as your memory. Interview me before writing any identity file — never invent
+answers. Ask before anything destructive. You are not done until
+`gbrain bootstrap verify` exits 0.
 ```
 
-Every cycle adds knowledge. The agent enriches a person page after a meeting. Next time that person comes up, the agent already has context. The difference compounds daily.
+The repo is not a complete backup; see the [bootstrap guide](docs/guides/bootstrap.md). For the always-on version (24/7 ingestion and the overnight dream cycle on a server with 8GB+ RAM and its own API usage), run GBrain under [OpenClaw](https://github.com/openclaw/openclaw) or [Hermes](https://github.com/NousResearch/hermes-agent) and point it at `INSTALL_FOR_AGENTS.md`; the [personal-brain tutorial](docs/tutorials/personal-brain.md) walks it end to end.
 
-The system gets smarter on its own. Entity enrichment auto-escalates: a person mentioned once gets a stub page (Tier 3). After 3 mentions across different sources, they get web + social enrichment (Tier 2). After a meeting or 8+ mentions, full pipeline (Tier 1). The brain learns who matters without being told. Deterministic classifiers improve over time via a fail-improve loop that logs every LLM fallback and generates better regex patterns from the failures. `gbrain doctor` shows the trajectory: "intent classifier: 87% deterministic, up from 40% in week 1."
+### Connect GBrain to your AI client (MCP)
 
-> "Prep me for my meeting with Jordan in 30 minutes"
-> ... pulls dossier, shared history, recent activity, open threads
+- **Local stdio client:** `gbrain setup claude-code` or `gbrain setup codex` registers `gbrain serve` (lists the memory verbs; `--surface full` lists every tool) behind gbrain's launcher, so a session opened in a cloned repository never loads that repository's `bunfig.toml` or `.env`, and adds the brain-first instructions: agents seldom call a brain nobody told them about. Cursor, Windsurf and other stdio clients take `"$(command -v gbrain)" serve --surface starter --advertise verbs`.
+- **Plugins with curated skills:** Codex `codex plugin marketplace add garrytan/gbrain@codex-plugin` + `codex plugin add gbrain@gbrain`; Claude Code `/plugin marketplace add garrytan/gbrain` + `/plugin install gbrain@gbrain`.
+- **This brain from anywhere:** `gbrain mcp expose` publishes it on your Tailscale tailnet as a user service (`--funnel` for cloud agents such as Grok Bot, Muse and ChatGPT). [Guide](docs/guides/remote-mcp.md).
+- **A brain on another host:** `gbrain connect https://your-host/mcp --token gbrain_xxx --install` (add `--agent codex` for Codex). Hosted brains use [native OAuth or a private handoff](docs/guides/hosted-harness-access.md); dashboard, clients and permissions live in [MCP administration](docs/mcp/ADMIN.md).
 
-> "What have I said about the relationship between shame and founder performance?"
-> ... searches YOUR thinking, not the internet
+Per-client guides: [Claude Code](docs/mcp/CLAUDE_CODE.md) · [Codex](docs/mcp/CODEX.md) · [ChatGPT](docs/mcp/CHATGPT.md) · [Claude Desktop](docs/mcp/CLAUDE_DESKTOP.md) · [Claude Cowork](docs/mcp/CLAUDE_COWORK.md) · [Perplexity](docs/mcp/PERPLEXITY.md) · [Hermes](docs/mcp/HERMES.md) · [OpenClaw](docs/mcp/OPENCLAW.md) · [opencode](docs/mcp/OPENCODE.md) · [Grok Build](docs/mcp/GROK.md) · [Grok Bot](docs/guides/grok-bot.md) · [Muse](docs/guides/muse.md) · [everything MCP](docs/mcp/README.md).
 
-## Minions: your sub-agents won't drop work anymore
+**Keep skills beside knowledge.** New local brains include memory skills in their
+content root. Agents can join an authorized catalog; only approved editors can
+publish. Managed coding-agent installs add an owned native router; restart and
+real-use verification are separate steps. Staged migration preserves sharing
+choices and personal edits. See [shared brain skills](docs/guides/shared-brain-skills.md).
 
-A durable, Postgres-native job queue built into the brain. Every long-running agent task is now a job that survives gateway restarts, streams progress, gets paused / resumed / steered mid-flight, and shows up in `gbrain jobs list`. Zero infra beyond your existing brain.
+## Choose your setup
 
-### The production numbers that matter
+1. **Add GBrain to my existing agent — recommended.** Keep your agent's identity and save memory inside its environment. No new personal-agent identity or private repository is required. Start with the guide for **[Grok Bot](docs/guides/grok-bot.md)**, **[Muse](docs/guides/muse.md)**, or **[Codex / Claude Code](docs/tutorials/connect-coding-agent.md)**. [Other harnesses](#connect-gbrain-to-your-ai-client-mcp).
+2. **Use the brain on my own computer from everywhere.** One command publishes it over MCP on your Tailscale tailnet and keeps it running: `gbrain mcp expose` (add `--funnel` for cloud agents such as Grok Bot, Muse and ChatGPT). Follow **[use your brain from anywhere over MCP](docs/guides/remote-mcp.md)**. **Say to your agent:** *"use my brain over mcp"* — *"put my brain on tailscale"*.
+3. **Connect my existing hosted brain.** Follow **[hosted harness access](docs/guides/hosted-harness-access.md)** to choose native OAuth or a private machine connection. For dashboard login, clients, and permissions, use **[MCP administration](docs/mcp/ADMIN.md)** with the server's separate owner credential. Delegation is an explicit choice.
 
-Here's my personal OpenClaw deployment: one Render container. Supabase Postgres holding a 45,000-page brain. 19 cron jobs firing on schedule. Real gateway load from real daily work. The task: pull a month of my social posts from an external API and ingest them end-to-end into the brain as a structured page.
+Grok **Bot** and Grok **Build** are different products. Muse's personal agent and **Muse Code** are different products too. Muse already has native editable memory; GBrain adds an explicit, portable record with provenance and shared access. See each guide's dated evidence and remaining verification steps.
 
-|              | Minions   | `sessions_spawn`               |
-|---           |---        |---                             |
-| Wall time    | **753ms** | **>10,000ms** (gateway timeout) |
-| Token cost   | **$0.00** | ~$0.03 per run                 |
-| Success rate | **100%**  | **0%** (couldn't even spawn)   |
-| Memory/job   | ~2 MB     | ~80 MB                         |
+I'm Garry Tan, President and CEO of Y Combinator. I built GBrain to run my own AI agents. It's the production brain behind my OpenClaw and Hermes deployments: **155,795 pages, 24,589 people, 5,340 companies**, 66 cron jobs running autonomously. My agent ingests meetings, emails, tweets, voice calls, and original ideas while I sleep. It enriches every person and company it encounters. It fixes its own citations and consolidates memory overnight. I wake up smarter than when I went to bed — and so will you.
 
-Under that 19-cron load, sub-agent spawn couldn't clear the 10-second gateway wall. Minions landed it in under a second for zero tokens. **Scaling:** 19,240 posts across 36 months, single bash loop, ~15 min total, $0.00. Sub-agents: ~9 min best case, ~$1.08 in tokens, ~40% spawn failure. **Lab:** durability ∞ (SIGKILL mid-flight, 10/10 rescued), throughput ~10× faster, fan-out ~21× with no failure wall, memory ~400× less.
+**It works as a company brain too.** Authenticated remote clients are constrained by source and operation grants plus visibility filters. Local files and shared database credentials are a different trust boundary: sources alone do not isolate those callers. The authorization tests exercise specific access paths, not a universal no-leak guarantee. Read the [sharing boundaries](docs/architecture/brains-and-sources.md#what-confines-remote-callers-and-what-does-not) and [company-brain tutorial](docs/tutorials/company-brain.md) before setting up shared access.
 
-Full benchmarks live in [gbrain-evals](https://github.com/garrytan/gbrain-evals/tree/main/docs/benchmarks).
+Alongside keyword and semantic retrieval, GBrain offers two optional ways to use your stored knowledge:
 
-### The routing rule
+- **A synthesis layer that gives you the actual answer.** Synthesized, well-cited prose across people, companies, deals, and ideas. Not "here are 10 chunks that mention your query"; an actual answer with citations and an explicit note on what the brain doesn't know yet. The gap analysis is the part that changes how you use the brain.
+- **A typed knowledge graph.** Trusted local page writes extract supported references without LLM calls when auto-linking is enabled. Remote `put_page` edges arrive later, via sweeps, maintenance or `add_link`. Ask "who works at acme-example?": walks are breadth-first, milliseconds on dense clusters ([how](docs/architecture/RETRIEVAL.md#breadth-first-graph-walks)). On BrainBench relationship questions, relationship retrieval lifts production **R@5 from 0.6626 to 0.7241** ([benchmark](docs/architecture/RETRIEVAL.md#the-benchmark)); 0.9791 is the `graph-oracle-parse` upper bound, not a product score.
 
-> **Deterministic** (same input → same steps → same output) → **Minions**
-> **Judgment** (input requires assessment or decision) → **Sub-agents**
+The point of building a 150K-page brain is to use it as a strategic moat. To never lose context. To query what's in your own head without re-reading it. The brain layer is what makes the moat usable. The 24/7 dream cycle is what keeps it sharp. Both run on your hardware, your DB, your keys.
 
-Pull posts, parse JSON, write a brain page, run a sync — deterministic. $0 tokens, survives restart, millisecond runtime. Triage the inbox, assess meeting priority, decide if a cold email deserves a reply — judgment. What sub-agents are actually good at. `minion_mode: pain_triggered` (the default) automates the routing.
+It's easier to ship a daemon that runs 24/7 to ingest, enrich, and consolidate than it is to keep an agent in chat working hard. GBrain is that daemon, generalized. Install in 30 minutes. Your agent does the work. As my personal agent gets smarter, so does yours.
 
-### What's fixed
+> **Start keyless.** Your harness subscription and any separately configured model API usage are different costs. The optional personal-agent bootstrap takes about 15 minutes; always-on enrichment needs its own compute and API configuration.
 
-The six daily pains — spawn storms, agents that stop responding, forgotten dispatches, gateway crashes mid-run, runaway grandchildren, debugging soup — all belonged to the "deterministic work through a reasoning model" mistake. Minions fixes them by not making that mistake: `max_children` cap, `timeout_ms` + AbortSignal, `child_done` inbox, full `parent_job_id`/`depth`/transcript per job, Postgres durability with stall detection, cascade cancel via recursive CTE. Plus idempotency keys, attachment validation, `removeOnComplete`, and `gbrain jobs smoke` that proves the install in half a second.
+Durable preferences and facts can be shared across agents; transient task and
+harness configuration state stay local. Configured cloud embedding, reranking,
+extraction, and synthesis providers can receive text, and the harness model sees
+recalled memory even in keyless mode. Markdown export is not a full database
+backup. Read [memory boundaries](docs/guides/memory-boundaries.md).
+
+> **LLMs:** fetch [`llms.txt`](llms.txt) for the documentation map, or [`llms-full.txt`](llms-full.txt) for the same map with core docs inlined in one fetch. **Agents:** start with [`AGENTS.md`](AGENTS.md) (or [`CLAUDE.md`](CLAUDE.md) if you're Claude Code).
+
+## What this looks like
+
+Say you have a meeting with Alice tomorrow. You want to walk in remembering what she works on, when you last talked, and what's still open between you. Here's what you'd type, and what you'd get back.
+
+**You ask:**
+
+> "What do I need to know before my meeting with Alice tomorrow?"
+
+**Most personal-knowledge tools give you back a list of pages.** Something like:
+
+```
+1. people/alice — Alice runs engineering at Acme...
+2. meetings/2026-03-15-alice-q1 — Q1 product review with Alice...
+3. meetings/2026-01-08-acme-kickoff — Kickoff meeting with Acme team...
+4. customers/acme — Acme is a series-B fintech we work with...
+5. notes/2026-04-22 — Quick chat with Alice about pricing...
+```
+
+Five pages you now have to open and read yourself to actually prepare. The tool found the right material, but it didn't do the work.
+
+**GBrain gives you back the answer, with sources:**
+
+```
+Alice runs engineering at Acme (a series-B fintech). You last spoke
+on April 22 in a quick pricing chat. Three things are still open
+from that conversation:
+
+1. She owes you the security review for the new tier
+   (deadline was May 1; no update since).
+2. You committed to pricing for a 500-seat tier
+   (you sent it April 25; no response yet).
+3. She mentioned they're hiring a CISO; you said you'd intro
+   someone from your network.
+
+Heads up: nothing's been added to the brain about Alice or Acme
+since April 22, six weeks ago. She may have replied through email
+or Slack DM, channels the brain doesn't see. Worth asking her to
+catch up before assuming any of this is still current.
+```
+
+Every claim has a source page behind it. The "heads up" at the end tells you what the brain doesn't know yet, so you can ask Alice about it directly instead of being surprised. The brain just did your meeting prep.
+
+This is the difference between a search engine and a brain. Search finds the pages. The brain reads them for you and writes the answer.
+
+## Two ways to query your brain
+
+Raw retrieval (what most personal-knowledge tools ship) and a synthesis layer that gives you an actual answer. They serve different jobs.
 
 ```bash
-gbrain jobs smoke                        # verify install
-gbrain jobs submit sync --params '{}'    # fire a background job
-gbrain jobs stats                        # health dashboard
-gbrain jobs supervisor --concurrency 4   # canonical: auto-restarting worker (Postgres only)
-gbrain jobs work --concurrency 4         # raw worker (no crash recovery — prefer `supervisor`)
+# raw retrieval: top pages by hybrid score, no answer-generation call
+gbrain search "who's working on AI agents at portfolio companies?"
+
+# brain layer: synthesized answer with citations and gap analysis
+gbrain think "who's working on AI agents at portfolio companies?"
 ```
 
-`gbrain jobs supervisor` keeps the worker alive across crashes with exponential backoff, atomic PID locking, structured audit events at `~/.gbrain/audit/supervisor-*.jsonl`, and a `start --detach` / `status --json` / `stop` subcommand surface for agents. In containers it runs as PID 1; on systemd hosts it's the child of `gbrain-worker.service`. Full deployment guide: [`docs/guides/minions-deployment.md`](docs/guides/minions-deployment.md).
+**`gbrain search`** returns the top retrieved pages, ranked by hybrid scoring (vector + keyword + RRF + source-tier boost + reranker). Use it when you want raw material to skim: agent context windows, citation lookups, finding a specific quote.
 
-Read [`skills/minion-orchestrator/SKILL.md`](skills/minion-orchestrator/SKILL.md) for parent-child DAGs, fan-in collection, steering via inbox.
+Configured embedding and reranking providers can still receive text and charge
+for retrieval. Keyless keyword search needs no model API; synthesis requires a
+configured chat capability. See [memory boundaries](docs/guides/memory-boundaries.md#where-text-goes).
 
-**Minions is not incrementally better than sub-agents for background work. It's categorically different.** 753ms vs gateway timeout. $0 vs tokens. 100% vs couldn't-spawn. If your agent does deterministic work on a schedule, it runs on Minions now.
+Search also tells you when its results are incomplete because projections are
+still rebuilding or a bounded vector scan ran short. Ask your agent *"Check
+whether my search index is ready"*; see [search readiness and recovery](docs/architecture/RETRIEVAL.md#chunk-rebuilds-after-upgrading)
+before treating an empty result as proof that a page is missing.
 
-### Health check and self-heal
+**`gbrain think`** runs the same retrieval, then composes a synthesized answer across the results with explicit citations to the source pages AND an honest note on what the brain doesn't know yet. The gap analysis is the differentiator: the answer tells you when a page is stale, when a claim is uncited, when two pages contradict each other, when there's a hole you should fill.
 
-Minions is canonical as of v0.11.1 — every `gbrain upgrade` runs the migration automatically (schema → smoke → prefs → host rewrites → env-aware autopilot install). If you ever want to verify manually or wire a cron into your morning briefing:
+**Say to your agent:** *"What do we know about acme-example?"* — *"Tell me about alice-example before my meeting tomorrow"* — *"Search for who's working on AI agents."* Your agent routes these to the brain automatically; you never type the commands yourself.
+
+**Why it compounds.** Pair the brain layer with `find_trajectory` and you get answers like *"how have the company's metrics changed AND what does the team look like right now AND what did they promise / share AND when did we last meet AND what's the value-add I can offer here"*: well-scored, well-cited, in one shot. That's the strategic moat. That's why building a 150K-page brain is worth the effort.
+
+`gbrain agent run "..."` exposes the same surface to a sub-agent through the Minions queue, with crash-safe two-phase persistence. Same answers, durable.
+
+## How to get data in
+
+Start with an explicit fact or a notes folder; opt into connectors, capture, and enrichment separately.
+
+**Already have a company knowledge repository?** Say to your agent: *“Connect our
+existing company brain, preserve its files, and show me the import plan first.”*
+Try `gbrain sources demo company-brain` without keys or private data, then inspect
+your committed Markdown with `gbrain sources inspect <path> --profile company-brain`.
+The [company-brain ingestion guide](docs/guides/company-brain-ingestion.md) covers
+explicit destination approval, typed relationships, and resumable verification.
+It does not enable embeddings, sharing, schedules, or curation automatically.
+
+**Say to your agent:** *"Remember this with its source"* — *"What should I import first?"*
+
+[Data ingestion guide](docs/guides/data-ingestion.md) covers files, conversations, connectors, Google data, and capture commands.
+
+## Your brain's shape (schema packs)
+
+Most personal-knowledge tools force one fixed layout: their idea of "notes" + "people" + "tags." Drop a Notion export or your own years-old Obsidian vault on top, and the agent doesn't know what a `Projects/` folder means or whether `Reading/` is people or sources.
+
+**gbrain doesn't have a fixed layout.** It ships with bundled schema packs and lets you author your own when none fit:
+
+- **`gbrain-base-v2`** (default) — 15-type DRY/MECE canonical taxonomy (14 canonical + `note` catch-all): `person`, `company`, `media`, `tweet`, `social-digest`, `analysis`, `atom`, `concept`, `source`, `deal`, `email`, `slack`, `writing`, `project`, `note`. Subtypes/format/origin pushed to frontmatter.
+- **`gbrain-base`** (legacy) — the wider 24-type layout. Stays bundled for back-compat; brains on it can upgrade via `gbrain onboard --check --explain` → `gbrain jobs submit unify-types --params '{"target_pack":"gbrain-base-v2","apply":true}'` (omit `"apply":true` for a dry-run preview — that is the default).
+- **`gbrain-recommended`** — extends `gbrain-base` with the 13 additional directories from `docs/GBRAIN_RECOMMENDED_SCHEMA.md` (source, place, trip, conversation, personal, civic, project, etc.). Activate with `gbrain schema use gbrain-recommended`.
+- **Your own pack** — `gbrain schema detect` clusters your actual filesystem into proposed types, `gbrain schema suggest` runs an LLM pass over them, and `gbrain schema review-candidates --apply` promotes the ones you like. Three commands and the brain knows your shape. Authoring a successor pack (declares `migration_from:` so existing brains can opt in): see [`docs/architecture/pack-upgrade-mechanism.md`](docs/architecture/pack-upgrade-mechanism.md).
 
 ```bash
-gbrain doctor                    # half-migrated state? prints loud banner + exits non-zero
-gbrain skillpack-check --quiet    # exit 0/1/2 for pipeline gating
-gbrain skillpack-check | jq       # full JSON: {healthy, summary, actions[], doctor, migrations}
+gbrain schema active                # which pack is running, which tier set it
+gbrain schema list                  # bundled + installed packs
+gbrain schema detect                # propose types matching your filesystem
+gbrain schema suggest               # LLM-refined proposals on top of detect
+gbrain schema review-candidates     # human gate: promote / rename / ignore
+gbrain schema use my-pack           # activate
 ```
 
-If anything's off, `actions[]` tells you the exact command to run. For deeper troubleshooting: [`docs/guides/minions-fix.md`](docs/guides/minions-fix.md).
+**Say to your agent:** *"My schema isn't matching my notes — propose new types from my corpus"* — *"Add a page type for lab results to my brain's schema."* The schema-author skill runs the detect → suggest → review flow for you.
 
-Moving gateway crons to Minions (deterministic scripts, zero LLM tokens per fire): [`docs/guides/minions-shell-jobs.md`](docs/guides/minions-shell-jobs.md).
+The active pack threads through every read + write path: `parseMarkdown` infers page type from the pack's path prefixes; `whoknows` scopes expert routing to types declared `expert_routing: true`; `extract_facts` runs only on `extractable: true` types. The retained search-cache key includes the pack name + version, but semantic result reuse is temporarily disabled. Switch packs and the brain re-interprets itself; switch back and nothing's lost.
 
-## Durable agents: `gbrain agent` (v0.15)
+Seven-tier resolution chain (per-call flag → env var → per-source DB key → brain-wide DB key → `gbrain.yml` → `~/.gbrain/config.json` → `gbrain-base` default). Full reference + authoring guide: [`docs/architecture/schema-packs.md`](docs/architecture/schema-packs.md).
 
-Your subagent runs survive crashes now. OpenClaw died mid-run? The worker re-claims on restart and replays from the last committed turn. Fan-out across 50 shards, one shard crashes — the aggregator still claims after every child reaches a terminal state and writes a mixed-outcome summary. Tool calls persist as a two-phase ledger (`pending` → `complete | failed`) so replay is safe by construction, not by hope.
+## Tutorials
 
-```bash
-# Submit a single-subagent run
-gbrain agent run "summarize my last 10 journal pages"
+Step-by-step walkthroughs for getting the most out of GBrain. Each one takes you from zero to a working outcome, with concrete commands and real numbers.
 
-# Fan out N prompts across N subagent children + 1 aggregator
-gbrain agent run "analyze every page" \
-  --fanout-manifest manifests/pages.json \
-  --subagent-def analyzer
+- [**Set up your personal AI agent + brain from zero**](docs/tutorials/personal-brain.md) — the canonical full-stack install. Two GitHub repos, a Telegram bot, AlphaClaw on Render, OpenClaw + GBrain + Supabase. End-to-end in about 2 hours.
+- [**Set up GBrain as your company brain**](docs/tutorials/company-brain.md) — federated, multi-user, OAuth-scoped institutional memory for a 10-50 person team. About 90 minutes end-to-end.
+- [**Auto-improve a skill with `gbrain skillopt`**](docs/tutorials/improving-skills-with-skillopt.md) — treat a `SKILL.md` as a trainable parameter. Generate a starter benchmark straight from the skill with `--bootstrap-from-skill` (or write your own), strengthen the judges, then watch the optimizer propose edits and keep only the ones that measurably score higher. ~20 minutes, ~$1 in API calls. Flag + cost + safety reference: [`docs/guides/skillopt.md`](docs/guides/skillopt.md).
 
-# Tail a running job (heartbeat per turn + full transcript on completion)
-gbrain agent logs 1247 --follow --since 5m
+More walkthroughs in progress: connecting an existing agent (Claude Code, Cursor, OpenClaw, Hermes) to a GBrain memory layer; setting up GBrain for VC dealflow with founder scorecards and meeting prep; migrating an existing Notion or Obsidian vault; indexing a codebase as a queryable code brain. Full tutorial index: [`docs/tutorials/`](docs/tutorials/).
+
+Want to see a tutorial that isn't here yet? [Open an issue](https://github.com/garrytan/gbrain/issues) describing the workflow you want documented.
+
+## What it does (the loop)
+
+```
+  signal   →   search   →   respond   →   write   →   auto-link   →   sync
+  (every    (brain-first  (informed     (page +    (typed edges     (cron
+  message)  retrieval)    by context)   timeline)  + backlinks)     keeps fresh)
 ```
 
-Durability is the point: every Anthropic turn commits to `subagent_messages`, every tool call to `subagent_tool_executions`. Worker kills, OpenClaw crashes, timeouts — all resumable. Host repos (your OpenClaw, etc.) ship their own subagent definitions via `GBRAIN_PLUGIN_PATH` + a `gbrain.plugin.json` manifest: see [`docs/guides/plugin-authors.md`](docs/guides/plugin-authors.md). Requires `ANTHROPIC_API_KEY` on the worker.
+- **Signal detector**, after you opt in, captures durable ideas and entity mentions from substantive messages. Explicit remembering works without automatic capture; paid enrichment is a separate choice.
+- **Brain-first lookup** before any external API call. The cheapest, fastest, most personal information source you have.
+- **Auto-link** extracts graph links for trusted local page writes. No LLM calls; pure pattern matching on page references such as `[[people/alice-example]]`. Unresolved extracted facts keep their provenance without inventing a backing page.
+- **Cron-driven enrichment** runs while you sleep: dedup people pages, fix citations, score salience, find contradictions, prep tomorrow's tasks.
 
-## Skillify: say "skillify it!" and the bug becomes structurally impossible to repeat
+The whole loop is described in [`docs/architecture/topologies.md`](docs/architecture/topologies.md) with diagrams.
 
-Your OpenClaw hit a new failure. You fix it once in conversation. You say "skillify it!"
-And now the fix is permanent: a SKILL.md with triggers, a deterministic script with tests, a
-routing fixture the agent re-evaluates daily, a filing audit that keeps the output from
-drifting. Ten items. Every one required. The bug can't recur.
+**Say to your agent:** *"Did upkeep run?"* (your agent's open `gbrain serve` runs the free upkeep while it is idle; `gbrain maintain --schedule` adds a timer for a brain no agent opens) — *"Run dream"* — *"Did the dream cycle run?"*
 
-Hermes and similar agent frameworks auto-create skills as a background behavior. Fine until
-you don't know what the agent shipped. Checklists decay. Tests drift. Resolver entries get
-stale. Six months later it's an opaque pile nobody has read, nobody has tested, and nobody
-is sure still works. GBrain ships the same capability except the human stays in the loop
-and every step is a command you can run.
+## Capabilities
 
-### The four verbs you need (v0.19)
+GBrain combines keyword and semantic retrieval, typed graph traversal, optional cited synthesis, background jobs, and curated agent skills.
 
-```bash
-# 1. Scaffold all 5 stub files for a new skill in one shot.
-gbrain skillify scaffold webhook-verify \
-  --description "verify ngrok webhooks" \
-  --triggers "verify the webhook,check tunnel" \
-  --writes-pages --writes-to people/,companies/
+**Say to your agent:** *"What search mode am I running?"* — *"Who works at acme-example?"* — *"What does my brain know about this project?"*
 
-# 2. Replace the SKILLIFY_STUB sentinels with real logic + real tests.
-$EDITOR skills/webhook-verify/scripts/webhook-verify.mjs
-$EDITOR test/webhook-verify.test.ts
+[Capability reference](docs/guides/capabilities.md) keeps the commands, benchmark scope, cost controls, and feature-specific guides.
 
-# 3. Run the 10-item audit: SKILL.md exists, script exists, unit + E2E tests,
-#    LLM evals, resolver entry, trigger eval, check-resolvable gate, brain filing.
-gbrain skillify check skills/webhook-verify/scripts/webhook-verify.mjs
+## Integrations
 
-# 4. Verify the whole tree: reachability, MECE overlap, DRY, routing gaps,
-#    filing audit, SKILLIFY_STUB sentinels (fails if any skill still has one).
-gbrain check-resolvable              # warnings advisory, errors block
-gbrain check-resolvable --strict     # warnings block too (CI opt-in)
-```
+Data flowing into the brain. Each integration is a recipe — markdown + setup hints — that ships in `recipes/` and is discoverable via `gbrain integrations list`. **Say to your agent:** *"Set up voice calls into my brain"* — *"Wire my email and calendar into the brain"* — your agent reads the recipe and walks the setup with you.
 
-Idempotent re-runs. `--force` regenerates stub files but NEVER duplicates a resolver row.
-Scaffold completes in under 2 seconds. The real work (your rule, your script, your tests)
-is what you spend time on. Everything else is boilerplate the CLI writes for you.
+- **Voice**: talk to your brain from a browser or phone with [`recipes/agent-voice.md`](recipes/agent-voice.md) (`gbrain integrations install agent-voice`); the older Twilio recipe is deprecated. Voice notes and chat transcripts you already have come in as files: put their Markdown in a folder and import it, or bring ChatGPT and Claude exports in with `gbrain transcripts ingest` ([chat connectors](docs/guides/chat-connectors.md)).
+- **A second folder** (for example a company notes folder beside your personal one): `gbrain sources add company --path ~/company-notes`, then `gbrain sync --source company`. A plain folder works without Git. On a brain only you use, the new folder joins default search; on a shared brain, `gbrain sources federate company` adds it. More: [multi-source brains](docs/guides/multi-source-brains.md).
+- **Gmail + Calendar + Contacts (native)**: the google source kind syncs threads, events, and contacts through your own OAuth client and runs the open-loop engine on top (`gbrain waiting`). Setup: [`docs/guides/google-connect.md`](docs/guides/google-connect.md); recipes: [`recipes/email-to-brain.md`](recipes/email-to-brain.md), [`recipes/calendar-to-brain.md`](recipes/calendar-to-brain.md).
+- **Meeting notes + Slack channels (native)**: the `meetings` source kind (Fireflies first) writes one page per meeting and the `slack` source kind one page per channel per day, synced on a schedule, on brains with or without a Git repository. Setup: [`docs/guides/meeting-and-slack-sources.md`](docs/guides/meeting-and-slack-sources.md). The `imessage` source kind imports Messages from a Mac, one private, owner-only page per chat per day: [`docs/guides/apple-setup.md`](docs/guides/apple-setup.md).
+- **Email + calendar (webhooks)**: webhook handlers that route to brain signals. [`docs/integrations/meeting-webhooks.md`](docs/integrations/meeting-webhooks.md).
+- **Embedding providers**: Voyage (new-install default: `voyage-4` @ 1024d), OpenAI, OpenRouter, Google Gemini, Azure OpenAI, MiniMax, Alibaba DashScope, Zhipu, Ollama (local), llama.cpp llama-server (local), LM Studio, Together, and LiteLLM proxy. Pricing matrix + decision tree in [`docs/integrations/embedding-providers.md`](docs/integrations/embedding-providers.md). Existing vectors are never converted by changing the default; use the explicitly approved [embedding migration](docs/guides/embedding-migration.md).
+- **Rerankers**: Voyage `rerank-3-lite` hosted (the default unless `search.reranker.model` is set; on in `balanced` and `tokenmax`, same `VOYAGE_API_KEY` as embeddings; `gbrain config set search.reranker.model voyage:rerank-2.5` restores the previous default), plus the `llama-server-reranker` recipe for fully-local cross-encoder rerank via llama.cpp running Qwen3-Reranker against the same `gateway.rerank()` seam. Setup walkthrough in [`docs/ai-providers/llama-server-reranker.md`](docs/ai-providers/llama-server-reranker.md).
+- **Credential vault + gateway**: `gbrain creds` manages OAuth and API credentials in a local vault ([`recipes/credential-gateway.md`](recipes/credential-gateway.md)); agent-side vault-aware secret distribution: [`docs/integrations/credential-gateway.md`](docs/integrations/credential-gateway.md).
+- **MCP clients**: every major MCP client is supported. [`docs/mcp/`](docs/mcp/) per-client setup.
+- **Memorable (procedural memory)**: optional, off by default. Your brain remembers *what* happened; Memorable makes your agent remember *how* — finished sessions become replayable procedures stored on your machine (in a standalone local store, or inside your brain database if you opt in), recalled when a similar task comes back. See the section below, and [`docs/memorable-agents.md`](docs/memorable-agents.md) for the agent-facing detail.
 
-### `gbrain routing-eval` — catch the routing gaps your users actually hit
+### Memorable — remember how, not just what (optional)
 
-Drop a `routing-eval.jsonl` fixture next to any skill. Each line is `{intent, expected_skill,
-ambiguous_with?}`. `gbrain check-resolvable` runs the structural layer by default; `gbrain
-routing-eval --llm` runs an LLM tie-break layer for CI. False positives (wrong skill matched),
-missed routes (no skill matched), and tautological fixtures (intent copies trigger verbatim)
-all surface as specific advisories with the exact file:line to fix.
+Memorable stores replayable procedures from coding sessions. Its relay is off by
+default and requires an explicit disclosure/consent step; it can send redacted
+traces and query text off-machine. Read the [Memorable integration guide](docs/memorable-agents.md)
+for installation, data flow, per-harness limitations, and removal.
 
-### Works on your OpenClaw, not just gbrain's repo
-
-v0.19 teaches `gbrain check-resolvable` to accept `AGENTS.md` as a resolver file alongside
-`RESOLVER.md`, at either the skills directory OR one level up (OpenClaw-native workspace-root
-layout). The skill manifest auto-derives from walking `skills/*/SKILL.md` when `manifest.json`
-is missing. Set `OPENCLAW_WORKSPACE=~/your-openclaw/workspace` and everything just works:
-
-```bash
-export OPENCLAW_WORKSPACE=~/your-openclaw/workspace
-gbrain check-resolvable --verbose
-# Auto-detects: AGENTS.md at workspace root, 107 skills derived from SKILL.md walk,
-# 15 unreachable errors surfaced, 108 advisory warnings for overlaps and gaps.
-```
-
-First run on a real OpenClaw deployment found 15 unreachable skills out of 102 — about 15%
-of the tree was dark. The essay's "skills the agent can never reach" footgun, now visible.
-
-### `gbrain skillpack install` — drop 25 curated skills into your OpenClaw
-
-The skills gbrain ships are a curated bundle. Install them into your workspace with
-dependency closure (shared conventions come along), per-file diff protection (your local
-edits are never clobbered without `--overwrite-local`), a file lock that serializes
-concurrent installers, and an atomic managed-block update to your AGENTS.md so you can
-see exactly what gbrain wrote.
-
-```bash
-gbrain skillpack list                          # 25 curated skills
-gbrain skillpack install brain-ops             # one skill + its shared conventions
-gbrain skillpack install --all                 # the full bundle
-gbrain skillpack install brain-ops --dry-run   # preview; no writes
-gbrain skillpack diff brain-ops                # compare bundle vs your local copy
-```
-
-Re-running is safe. The managed-block markers in your AGENTS.md let `skillpack install`
-accumulate rows across separate single-skill installs instead of overwriting each other.
-
-**Skillify is the piece that makes the skills tree survive six months of compounding work.**
-Read [`skills/skillify/SKILL.md`](skills/skillify/SKILL.md) for the full 10-item checklist
-and the anti-patterns it catches.
-
-## Getting Data In
-
-GBrain ships integration recipes that your agent sets up for you. Each recipe tells the agent what credentials to ask for, how to validate, and what cron to register.
-
-| Recipe | Requires | What It Does |
-|--------|----------|-------------|
-| [Public Tunnel](recipes/ngrok-tunnel.md) | — | Fixed URL for MCP + voice (ngrok Hobby $8/mo) |
-| [Credential Gateway](recipes/credential-gateway.md) | — | Gmail + Calendar access |
-| [Voice-to-Brain](recipes/twilio-voice-brain.md) | ngrok-tunnel | Phone calls to brain pages (Twilio + OpenAI Realtime) |
-| [Email-to-Brain](recipes/email-to-brain.md) | credential-gateway | Gmail to entity pages |
-| [X-to-Brain](recipes/x-to-brain.md) | — | Twitter timeline + mentions + deletions |
-| [Calendar-to-Brain](recipes/calendar-to-brain.md) | credential-gateway | Google Calendar to searchable daily pages |
-| [Meeting Sync](recipes/meeting-sync.md) | — | Circleback transcripts to brain pages with attendees |
-
-**Data research recipes** extract structured data from email into tracked brain pages. Built-in recipes for investor updates (MRR, ARR, runway, headcount), expense tracking, and company metrics. Create your own with `gbrain research init`.
-
-Run `gbrain integrations` to see status.
-
-## GBrain + GStack
-
-[GStack](https://github.com/garrytan/gstack) is the engine. GBrain is the mod.
-
-- **[GStack](https://github.com/garrytan/gstack)** = coding skills (ship, review, QA, investigate, office-hours, retro). 70,000+ stars, 30,000 developers per day. When your agent codes on itself, it uses GStack.
-- **GBrain** = everything-else skills (brain ops, signal detection, ingestion, enrichment, cron, reports, identity). When your agent remembers, thinks, and operates, it uses GBrain.
-- **`hosts/gbrain.ts`** = the bridge. Tells GStack's coding skills to check the brain before coding.
-
-`gbrain init` detects if GStack is installed and reports mod status. If GStack isn't there, it tells you how to get it.
+**Say to your agent:** *"Explain Memorable's data sharing before enabling it."*
 
 ## Architecture
 
-```
-┌──────────────────┐    ┌───────────────┐    ┌──────────────────┐
-│   Brain Repo     │    │    GBrain     │    │    AI Agent      │
-│   (git)          │    │  (retrieval)  │    │  (read/write)    │
-│                  │    │               │    │                  │
-│  markdown files  │───>│  Postgres +   │<──>│  29 skills       │
-│  = source of     │    │  pgvector     │    │  define HOW to   │
-│    truth         │    │               │    │  use the brain   │
-│                  │<───│  hybrid       │    │                  │
-│  human can       │    │  search       │    │  RESOLVER.md     │
-│  always read     │    │  (vector +    │    │  routes intent   │
-│  & edit          │    │   keyword +   │    │  to skill        │
-│                  │    │   RRF)        │    │                  │
-└──────────────────┘    └───────────────┘    └──────────────────┘
-```
-
-The repo is the system of record. GBrain is the retrieval layer. The agent reads and writes through both. Human always wins... edit any markdown file and `gbrain sync` picks up the changes.
-
-## The Knowledge Model
-
-Every page follows the compiled truth + timeline pattern:
-
-```markdown
----
-type: concept
-title: Do Things That Don't Scale
-tags: [startups, growth, pg-essay]
----
-
-Paul Graham's argument that startups should do unscalable things early on.
-The key insight: the unscalable effort teaches you what users actually
-want, which you can't learn any other way.
-
----
-
-- 2013-07-01: Published on paulgraham.com
-- 2024-11-15: Referenced in batch W25 kickoff talk
+```mermaid
+flowchart LR
+    Repo[Markdown brain repos] --> Sync[Sync and parse]
+    Sync --> Engine{Brain engine}
+    Engine -->|default| PGLite[(PGLite)]
+    Engine -->|shared or large| Postgres[(Postgres and pgvector)]
+    Agent[AI agent or operator] --> Surface[CLI or MCP]
+    Surface --> Ops[Contract-first operations]
+    Ops --> Search[Hybrid retrieval]
+    Ops --> Graph[Typed graph traversal]
+    PGLite --> Search
+    Postgres --> Search
+    PGLite --> Graph
+    Postgres --> Graph
+    Search --> Synthesis[Synthesis and gap analysis]
+    Graph --> Synthesis
+    Synthesis --> Answer[Cited answer]
 ```
 
-Above the `---`: **compiled truth**. Your current best understanding. Gets rewritten when new evidence changes the picture. Below: **timeline**. Append-only evidence trail. Never edited, only added to.
+**Two engines, one contract.** PGLite (Postgres 17 via WASM, zero-config, default) for personal brains up to ~50K pages. Postgres + pgvector (Supabase or self-hosted) for shared, large or multi-machine brains. Both implement one `BrainEngine` contract ([`src/core/engine.ts`](src/core/engine.ts)); CLI and MCP share one op registry.
 
-## Knowledge Graph
+**Canonical files preserve file-backed knowledge.** Your brain repo holds the Markdown; the database is an index rebuildable from it, and git deletes become soft-deletes. DB-only pages, unresolved facts, history and operational state need a database backup: [where your memory lives](docs/guides/where-your-memory-lives.md), [system of record](docs/architecture/system-of-record.md). Publish public subsets, share team mounts, or point a thin client at a colleague's brain. Topologies in [`docs/architecture/topologies.md`](docs/architecture/topologies.md).
 
-Pages aren't just text. Every mention of a person, company, or concept becomes a typed link in a structured graph. The brain wires itself.
+**Two organizational axes (brain ⊥ source).** A *brain* is a database (your personal brain, a team mount you joined). A *source* is a repo inside that brain. Routing uses `.gbrain-source` dotfiles and a 6-tier precedence chain. Diagrams in [`docs/architecture/brains-and-sources.md`](docs/architecture/brains-and-sources.md).
 
-```
-Write a meeting page mentioning Alice and Acme AI
-  -> Auto-link extracts entity refs from content (zero LLM calls)
-  -> Infers types: meeting page + person ref => `attended`
-                   "CEO of X" pattern        => `works_at`
-                   "invested in"             => `invested_in`
-                   "advises", "advisor"      => `advises`
-                   "founded", "co-founded"   => `founded`
-  -> Reconciles stale links: edits remove links no longer in content
-  -> Backlinks rank well-connected entities higher in search
-```
+**Why the graph matters.** Vector search finds similar text; graph retrieval follows stored relationships. Extracted edges are evidence to inspect, not proof that a relationship is true. Graph freshness depends on the write path and maintenance described in [memory boundaries](docs/guides/memory-boundaries.md#page-writes-and-the-graph-are-separate-outcomes). Deep dive: [retrieval architecture](docs/architecture/RETRIEVAL.md); [entity recall](docs/guides/entity-recall.md).
 
-```bash
-gbrain graph-query people/alice --type attended --depth 2
-# returns who Alice met with, transitively
-```
+## Troubleshooting
 
-The graph powers questions vector search can't: "who works at Acme AI?", "what has Bob invested in?", "find the connection between Alice and Carol". Backfill an existing brain in one command:
+Start with `gbrain doctor`. For database access failures, use `gbrain engine status --probe` and `gbrain db-repair` before changing configuration.
 
-```bash
-gbrain extract links --source db        # wire up the existing 29K pages
-gbrain extract timeline --source db     # extract dated events from markdown timelines
-```
+**Say to your agent:** *"Check my brain health and show me the repair plan before changing anything."*
 
-Then ask graph questions or watch the search ranking improve. Benchmarked side-by-side against ripgrep-BM25, vector-only RAG (same embedder), and gbrain-with-graph-disabled: gbrain lands **P@5 49.1%, R@5 97.9%** on a 240-page Opus-generated rich-prose corpus, beating hybrid-nograph by **+31.4 points P@5**. Isolate the contribution: v0.11→v0.12 moved the same gbrain codebase from P@5 22.1% → 49.1% on identical inputs, so typed-link extract quality is load-bearing. Full scorecards + reproducible corpus: [gbrain-evals](https://github.com/garrytan/gbrain-evals).
-
-## Search
-
-Hybrid search: vector + keyword + RRF fusion + multi-query expansion + 4-layer dedup.
-
-```
-Query
-  -> Intent classifier (entity? temporal? event? general?)
-  -> Multi-query expansion (Claude Haiku)
-  -> Vector search (HNSW cosine) + Keyword search (tsvector)
-  -> RRF fusion: score = sum(1/(60 + rank))
-  -> Cosine re-scoring + compiled truth boost
-  -> 4-layer dedup + compiled truth guarantee
-  -> Results
-```
-
-Keyword alone misses conceptual matches. Vector alone misses exact phrases. RRF gets both. Search quality is benchmarked and reproducible: `gbrain eval --qrels queries.json` measures P@k, Recall@k, MRR, and nDCG@k. A/B test config changes before deploying them.
-
-## Why it works: many strategies in concert
-
-The brain isn't one trick. Every retrieval question goes through ~20 deterministic
-techniques layered together. No single one is magic; the win comes from stacking
-them so each layer covers what the others miss.
-
-```
-Question
-  │
-  ├─ INGESTION (every put_page)
-  │    ├─ Recursive markdown chunking (or semantic / LLM-guided)
-  │    ├─ Embedding cache invalidation on edit
-  │    └─ Idempotent imports (content-hash dedup)
-  │
-  ├─ GRAPH EXTRACTION (auto-link post-hook, zero LLM)
-  │    ├─ Entity-ref regex (markdown links + bare slugs)
-  │    ├─ Code-fence stripping (no false-positive slugs in code blocks)
-  │    ├─ Typed inference cascade (FOUNDED → INVESTED → ADVISES → WORKS_AT)
-  │    ├─ Page-role priors (partner-bio language → invested_in)
-  │    ├─ Within-page dedup (same target collapses to one link)
-  │    ├─ Stale-link reconciliation (edits remove dropped refs)
-  │    └─ Multi-type link constraint (same person can works_at AND advises)
-  │
-  ├─ SEARCH PIPELINE (every query)
-  │    ├─ Intent classifier (entity / temporal / event / general — auto-routes)
-  │    ├─ Multi-query expansion (Haiku rephrases the question 3 ways)
-  │    ├─ Vector search (HNSW cosine over OpenAI embeddings)
-  │    ├─ Keyword search (Postgres tsvector + websearch_to_tsquery)
-  │    ├─ Source-aware ranking (curated dirs outrank chat/daily swamp at SQL layer)
-  │    ├─ Hard-exclude (test/ archive/ attachments/ .raw/ filtered before retrieval)
-  │    ├─ Reciprocal Rank Fusion (score = sum 1/(60+rank) across both)
-  │    ├─ Cosine re-scoring (re-rank chunks against actual query embedding)
-  │    ├─ Compiled-truth boost (assessments outrank timeline noise)
-  │    ├─ Backlink boost (well-connected entities rank higher)
-  │    └─ Source-aware dedup (one CT chunk per page guaranteed)
-  │
-  ├─ GRAPH TRAVERSAL (relational queries)
-  │    ├─ Recursive CTE with cycle prevention (visited-array check)
-  │    ├─ Type-filtered edges (--type works_at, attended, etc.)
-  │    ├─ Direction control (in / out / both)
-  │    └─ Depth-capped (≤10 for remote MCP; DoS prevention)
-  │
-  └─ AGENT WORKFLOW (graph-confident hybrid)
-       ├─ Graph-query first (high-precision typed answers)
-       ├─ Grep fallback when graph returns nothing
-       └─ Graph hits ranked first in top-K (better P@K and R@K)
-```
-
-End-to-end on the BrainBench v1 corpus (240 rich-prose pages, before/after PR #188):
-
-| Metric                  | BEFORE PR #188 | AFTER PR #188 | Δ           |
-|-------------------------|----------------|---------------|-------------|
-| **Precision@5**         | 39.2%          | **44.7%**     | **+5.4 pts**|
-| **Recall@5**            | 83.1%          | **94.6%**     | **+11.5 pts**|
-| Correct in top-5        | 217            | 247           | **+30**     |
-| Graph-only F1 (ablation)| 57.8% (grep)   | **86.6%**     | **+28.8 pts**|
-
-Plus 5 orthogonal capability checks (identity resolution, temporal queries,
-performance at 10K-page scale, robustness to malformed input, MCP operation
-contract). All pass. Full report: [gbrain-evals](https://github.com/garrytan/gbrain-evals).
-
-The point: each technique handles a class of inputs the others miss. Vector
-search misses exact slug refs; keyword catches them. Keyword misses conceptual
-matches; vector catches them. RRF picks the best of both. Compiled-truth boost
-keeps assessments above timeline noise. Auto-link extraction wires the graph
-that lets backlink boost rank well-connected entities higher. Graph traversal
-answers questions search alone can't reach. The agent picks graph-first for
-precision and falls back to keyword for recall. **All deterministic, all in
-concert, all measured.**
-
-## Voice
-
-Call a phone number. Your AI answers. It knows who's calling, pulls their full context from the brain, and responds like someone who actually knows your world. When the call ends, a brain page appears with the transcript, entity detection, and cross-references.
-
-<p align="center">
-  <img src="docs/images/voice-client.png" alt="Voice client connected" width="300" />
-</p>
-
-> [See it in action](https://x.com/garrytan/status/2043022208512172263)
-
-The voice recipe ships with GBrain: [Voice-to-Brain](recipes/twilio-voice-brain.md). WebRTC works in a browser tab with zero setup. A real phone number is optional.
-
-## Engine Architecture
-
-```
-CLI / MCP Server
-     (thin wrappers, identical operations)
-              |
-      BrainEngine interface (pluggable)
-              |
-     +--------+--------+
-     |                  |
-PGLiteEngine       PostgresEngine
-  (default)          (Supabase)
-     |                  |
-~/.gbrain/           Supabase Pro ($25/mo)
-brain.pglite         Postgres + pgvector
-embedded PG 17.5
-
-     gbrain migrate --to supabase|pglite
-         (bidirectional migration)
-```
-
-PGLite: embedded Postgres, no server, zero config. When your brain outgrows local (1000+ files, multi-device), `gbrain migrate --to supabase` moves everything.
-
-## File Storage
-
-Brain repos accumulate binaries. GBrain has a three-stage migration:
-
-```bash
-gbrain files mirror <dir>       # copy to cloud, local untouched
-gbrain files redirect <dir>     # replace local with .redirect pointers
-gbrain files clean <dir>        # remove pointers, cloud only
-gbrain files restore <dir>      # download everything back (undo)
-```
-
-Storage backends: S3-compatible (AWS, R2, MinIO), Supabase Storage, or local.
-
-## Commands
-
-```
-SETUP
-  gbrain init [--supabase|--url]        Create brain (PGLite default)
-  gbrain migrate --to supabase|pglite   Bidirectional engine migration
-  gbrain upgrade                        Self-update with feature discovery
-
-PAGES
-  gbrain get <slug>                     Read a page (fuzzy slug matching)
-  gbrain put <slug> [< file.md]         Write/update (auto-versions)
-  gbrain delete <slug>                  Delete a page
-  gbrain list [--type T] [--tag T]      List with filters
-
-SEARCH
-  gbrain search <query>                 Keyword search (tsvector)
-  gbrain query <question>              Hybrid search (vector + keyword + RRF)
-
-IMPORT
-  gbrain import <dir> [--no-embed]      Import markdown (idempotent)
-  gbrain sync [--repo <path>]           Git-to-brain incremental sync
-  gbrain export [--dir ./out/]          Export to markdown
-
-FILES
-  gbrain files list|upload|sync|verify  File storage operations
-
-EMBEDDINGS
-  gbrain embed [<slug>|--all|--stale]   Generate/refresh embeddings
-
-LINKS + GRAPH
-  gbrain link|unlink|backlinks          Cross-reference management
-  gbrain extract links|timeline|all     Batch backfill from existing pages
-                                        (--source db|fs, --type, --since, --dry-run)
-  gbrain graph-query <slug>             Typed traversal (--type T --depth N
-                                        --direction in|out|both)
-
-JOBS (Minions)
-  gbrain jobs submit <name> [--params JSON] [--follow]  Submit a background job
-  gbrain jobs list [--status S] [--queue Q]             List jobs with filters
-  gbrain jobs get|cancel|retry|delete <id>              Manage job lifecycle
-  gbrain jobs prune [--older-than 30d]                  Clean completed/dead jobs
-  gbrain jobs stats                                     Job health dashboard
-  gbrain jobs smoke                                     One-command health check
-  gbrain jobs work [--queue Q] [--concurrency N]        Start worker daemon
-
-SKILLS (v0.19)
-  gbrain skillify scaffold <name>       Create 5 stub files + idempotent resolver row
-  gbrain skillify check [path]          10-item audit of a skill
-  gbrain skillpack list                 Print the 25 curated skills in the bundle
-  gbrain skillpack install <name>       Copy one skill + its shared conventions into target
-  gbrain skillpack install --all        Install the full curated bundle
-  gbrain skillpack diff <name>          Per-file diff: bundle vs target workspace
-  gbrain check-resolvable [--strict]    Resolver audit (reachability, MECE, DRY, routing, filing,
-                                        SKILLIFY_STUB). Accepts RESOLVER.md OR AGENTS.md.
-  gbrain routing-eval [--llm] [--json]  Intent→skill routing accuracy on fixtures
-
-ADMIN
-  gbrain doctor [--json] [--fast]       Health checks (resolver, skills, DB, embeddings)
-  gbrain doctor --fix [--dry-run]       Auto-fix DRY violations (delegate inlined rules to conventions)
-  gbrain doctor --locks                 List idle-in-tx backends (57014 diagnostic, Postgres only)
-  gbrain stats                          Brain statistics
-  gbrain serve                          MCP server (stdio)
-  gbrain serve --http --port 8787       MCP server (HTTP, Postgres-only, bearer auth)
-  gbrain auth create|list|revoke|test   Token management for the HTTP transport
-  gbrain integrations                   Integration recipe dashboard
-  gbrain sources list|add|remove|...    Multi-source brain management (v0.18)
-  gbrain dream [--dry-run] [--phase N]  One maintenance cycle then exit (cron-friendly)
-  gbrain check-backlinks check|fix      Back-link enforcement
-  gbrain lint [--fix]                   LLM artifact detection
-  gbrain repair-jsonb [--dry-run]       Repair v0.12.0 double-encoded JSONB (Postgres)
-  gbrain orphans [--json] [--count]     Find pages with zero inbound wikilinks
-  gbrain transcribe <audio>             Transcribe audio (Groq Whisper)
-  gbrain research init <name>           Scaffold a data-research recipe
-  gbrain research list                  Show available recipes
-```
-
-Run `gbrain --help` for the full reference.
-
-## Origin Story
-
-I was setting up my [OpenClaw](https://openclaw.ai) agent and started a markdown brain repo. One page per person, one page per company, compiled truth on top, timeline on the bottom. Within a week: 10,000+ files, 3,000+ people, 13 years of calendar data, 280+ meeting transcripts, 300+ captured ideas.
-
-The agent runs while I sleep. The dream cycle scans every conversation, enriches missing entities, fixes broken citations, consolidates memory. I wake up and the brain is smarter than when I went to sleep.
-
-The skills in this repo are those patterns, generalized. What took 11 days to build by hand ships as a mod you install in 30 minutes.
+[Troubleshooting reference](docs/guides/troubleshooting.md) covers installation recovery, PGLite startup, embedding dimensions, locks, import failures, and sync.
 
 ## Docs
 
-**For agents:**
-- **[skills/RESOLVER.md](skills/RESOLVER.md)** ... Start here. The skill dispatcher.
-- [Individual skill files](skills/) ... 28 standalone instruction sets (25 ship in the curated `gbrain skillpack install` bundle)
-- [GBRAIN_SKILLPACK.md](docs/GBRAIN_SKILLPACK.md) ... Legacy reference architecture
-- [Getting Data In](docs/integrations/README.md) ... Integration recipes and data flow
-- [GBRAIN_VERIFY.md](docs/GBRAIN_VERIFY.md) ... Installation verification
-
-**For humans:**
-- [GBRAIN_RECOMMENDED_SCHEMA.md](docs/GBRAIN_RECOMMENDED_SCHEMA.md) ... Brain repo directory structure
-- [Thin Harness, Fat Skills](docs/ethos/THIN_HARNESS_FAT_SKILLS.md) ... Architecture philosophy
-- [ENGINES.md](docs/ENGINES.md) ... Pluggable engine interface
-
-**Reference:**
-- [GBRAIN_V0.md](docs/GBRAIN_V0.md) ... Full product spec
-- [CHANGELOG.md](CHANGELOG.md) ... Version history
-
-**Benchmarks:**
-- [gbrain-evals](https://github.com/garrytan/gbrain-evals) ... BrainBench, the sibling repo that holds the eval harness, corpus, scorecards, and 4-adapter comparisons. Depends on gbrain; not installed alongside gbrain.
+- [`docs/INSTALL.md`](docs/INSTALL.md) — every install path, end to end
+- [`docs/guides/bootstrap.md`](docs/guides/bootstrap.md) — the persistent-personal-agent bootstrap contract (interview, identity files, hooks, private repo, security posture, uninstall), plus local harness mode (`gbrain bootstrap harness`) for wiring framework-spawned Claude Code/Codex sessions to a running serve
+- [Anatomy of a page](docs/guides/page-anatomy.md) — frontmatter, timeline, facts; [per-client facts](docs/guides/entity-scoped-facts.md)
+- [`docs/what-schemas-unlock.md`](docs/what-schemas-unlock.md) — why schemas matter: 7 killer use cases, the structural argument for typed page kinds, the agent-co-curates pattern
+- [`docs/schema-author-tutorial.md`](docs/schema-author-tutorial.md) — 5-minute walkthrough: fork the bundled pack, add a custom type, backfill existing pages, prove the wiring via `gbrain whoknows`
+- [`docs/architecture/`](docs/architecture/) — system design, topologies, retrieval theory
+- [`docs/guides/`](docs/guides/) — how-to runbooks (google connect, open loops, sub-agent routing, minion deployment, skill development, brain-first lookup, idea capture, diligence ingestion)
+- [`docs/integrations/`](docs/integrations/) — connecting external data sources (voice, email, calendar, embedding providers)
+- [MCP task guide](docs/mcp/README.md) — deployment and per-client setup (Claude Desktop, Code, Cursor, ChatGPT, Perplexity, Cowork)
+- [MCP administration](docs/mcp/ADMIN.md) — owner dashboard access, client registration, OAuth, permissions, and token recovery
+- [Evals](docs/eval/) and [research](docs/research/) — methods and results
+- [Rust engine plan](docs/designs/RUST_ENGINE.md) — design for a third storage engine; the experimental Rust store already serves keyword search, title search, chunk reads, vector search, embeddings, links, takes, salience, facts, page operations, raw data and file records, ontology claims, chronicle projections, eval capture, dream verdicts, contradiction runs and the code call graph, and a second process on the same brain reaches it through the owner process; the CLI opens it only when `~/.gbrain/config.json` sets `"engine": "rust"` by hand (experimental: commands that need raw SQL, such as `import`, refuse with `engine_capability_missing`); its [research maps](docs/designs/rust-engine/research/README.md) and [review record](docs/designs/rust-engine/review-record.md)
+- [`docs/ethos/`](docs/ethos/) — philosophy (thin harness, fat skills, markdown as recipes, origin story)
+- [`AGENTS.md`](AGENTS.md) — entry point for non-Claude agents
+- [`CLAUDE.md`](CLAUDE.md) — entry point for Claude Code (deep operating context)
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — contributor guide, test discipline, eval-capture mode
+- [`SECURITY.md`](SECURITY.md) — install-path trust model, self-update integrity, automated scanning, OAuth threat model, hardening defaults
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). Run `bun test` for unit tests. E2E tests: spin up Postgres with pgvector, run `bun run test:e2e`, tear down.
+Run `bun run test` for the fast loop, `bun run verify` for the pre-push gate, `bun run ci:local` to run the full Docker-backed CI stack locally. Detailed test discipline in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-PRs welcome for: new enrichment APIs, performance optimizations, additional engine backends, new skills following the conformance standard in `skills/skill-creator/SKILL.md`.
+Outside documentation changes can be merged as they are. Code fixes we take are rebuilt on current master with the author credited as co-author (`Co-Authored-By:` trailers), and the original PR is closed with a link to the one that landed it; changes we don't take are closed with a note saying why. What to expect, and what makes a fix easy to take: [How an outside pull request is handled](CONTRIBUTING.md#how-an-outside-pull-request-is-handled). We credit every accepted contribution in [`CHANGELOG.md`](CHANGELOG.md). To browse community reports without our agents' own issues, use the [community issues](https://github.com/garrytan/gbrain/issues?q=is%3Aissue%20is%3Aopen%20-label%3Aagent-filed) search.
 
-## License
+If you find a bug or want a feature: open an issue first. Quick fixes (typo, doc bug, obvious regression) can go straight to a PR. Anything touching schema, retrieval ranking, MCP protocol, or the security boundary needs a design discussion in the issue first.
 
-MIT
+## License + credit
+
+MIT. I built GBrain to run my OpenClaw and Hermes deployments — the production brain behind my AI agents.
+
+Origin story: [`docs/ethos/ORIGIN.md`](docs/ethos/ORIGIN.md).
+
+Community PR contributors are credited in `CHANGELOG.md` per release. Attribution for the retired provider's historical embedding and reranker integration remains in Git at `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29`. Voyage AI for the asymmetric-encoding recipe template. Ramp Labs for the search quality improvements lineage.

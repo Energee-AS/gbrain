@@ -18,7 +18,8 @@ import type {
   ResolverRequest,
   ResolverResult,
 } from '../src/core/resolvers/index.ts';
-import { urlReachableResolver, checkDnsRebinding } from '../src/core/resolvers/builtin/url-reachable.ts';
+import { urlReachableResolver } from '../src/core/resolvers/builtin/url-reachable.ts';
+import { __setDnsLookupForTests } from '../src/core/ssrf-validate.ts';
 import { xHandleToTweetResolver, computeBackoffMs } from '../src/core/resolvers/builtin/x-api/handle-to-tweet.ts';
 
 // ---------------------------------------------------------------------------
@@ -167,15 +168,6 @@ describe('getDefaultRegistry', () => {
     const b = getDefaultRegistry();
     expect(a).toBe(b);
   });
-
-  test('_resetDefaultRegistry gives a fresh instance', () => {
-    const a = getDefaultRegistry();
-    a.register(echoResolver);
-    _resetDefaultRegistry();
-    const b = getDefaultRegistry();
-    expect(b).not.toBe(a);
-    expect(b.size()).toBe(0);
-  });
 });
 
 // ---------------------------------------------------------------------------
@@ -185,8 +177,12 @@ describe('getDefaultRegistry', () => {
 describe('url_reachable resolver', () => {
   const originalFetch = globalThis.fetch;
 
+  beforeEach(() => {
+    __setDnsLookupForTests((async () => [{ address: '8.8.8.8', family: 4 }]) as any);
+  });
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    __setDnsLookupForTests(undefined);
   });
 
   test('available() is true', async () => {
@@ -302,7 +298,7 @@ describe('url_reachable resolver', () => {
       context: makeCtx(),
     });
     expect(r.value.reachable).toBe(false);
-    expect(r.value.reason).toMatch(/redirect to blocked/i);
+    expect(r.value.reason).toMatch(/blocked.*redirect/i);
   });
 
   test('fetch network failure → reachable=false, confidence=1', async () => {
@@ -316,20 +312,21 @@ describe('url_reachable resolver', () => {
     expect(r.confidence).toBe(1);
   });
 
-  test('checkDnsRebinding: skips IP literals', async () => {
-    expect(await checkDnsRebinding('http://8.8.8.8/')).toBeNull();
-    expect(await checkDnsRebinding('http://127.0.0.1/')).toBeNull();
-    expect(await checkDnsRebinding('http://[::1]/')).toBeNull();
-  });
+  test('abort and transport diagnostics do not disclose signed URLs or upstream errors', async () => {
+    const url = 'https://example.com/private-document?signature=private-value';
+    const ac = new AbortController();
+    ac.abort();
+    const aborted = await urlReachableResolver.resolve({ input: { url }, context: makeCtx({ signal: ac.signal }) })
+      .catch(error => error);
+    expect(aborted).toBeInstanceOf(ResolverError);
+    expect(aborted.code).toBe('aborted');
+    expect(aborted.message).not.toContain('private-');
 
-  test('checkDnsRebinding: returns null for unparseable URL', async () => {
-    expect(await checkDnsRebinding('not a url')).toBeNull();
-  });
-
-  test('checkDnsRebinding: returns null on DNS failure (surface via fetch)', async () => {
-    // Nonexistent TLD; DNS lookup fails, we let the fetch surface the error.
-    const r = await checkDnsRebinding('http://definitely-not-a-real-tld.invalidtld123/');
-    expect(r).toBeNull();
+    globalThis.fetch = (async () => { throw new Error('TLS failure for private-document?signature=private-value'); }) as unknown as typeof fetch;
+    const result = await urlReachableResolver.resolve({ input: { url }, context: makeCtx() });
+    expect(result.value.reachable).toBe(false);
+    expect(result.value.reason).toContain('fetch error');
+    expect(result.value.reason).not.toContain('private-');
   });
 
   test('AbortSignal fires mid-flight → ResolverError(aborted)', async () => {
@@ -618,5 +615,100 @@ describe('x_handle_to_tweet resolver', () => {
     expect(query).not.toContain('to:someone');
     expect(query).toContain('normal');
     expect(query).toContain('words');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structural array-items guard for resolver inputSchema + outputSchema.
+//
+// v0.34 fix wave: handle_to_tweet's `candidates` field shipped as bare
+// `type: 'array'` without `items` (caught by community PR #910). Same
+// bug class as extract_facts.entity_hints, different surface. Resolvers
+// don't ride through buildToolDefs so the MCP-side structural guard
+// doesn't see them.
+//
+// This guard walks the builtin resolvers explicitly (NOT via
+// getDefaultRegistry(), which starts empty until commands/resolvers.ts
+// registers — codex catch). Both inputSchema AND outputSchema are
+// checked because resolvers are bidirectional.
+// ---------------------------------------------------------------------------
+
+interface SchemaNode {
+  type?: unknown;
+  properties?: Record<string, SchemaNode>;
+  items?: SchemaNode;
+  [k: string]: unknown;
+}
+
+function findArrayWithoutItems(node: SchemaNode | undefined, path: string[]): string[] {
+  const violations: string[] = [];
+  if (!node || typeof node !== 'object') return violations;
+  if (node.type === 'array') {
+    if (!node.items || typeof node.items !== 'object') {
+      violations.push(`${path.join('.') || '<root>'} (array missing items)`);
+    } else if (!('type' in node.items)) {
+      violations.push(`${path.join('.') || '<root>'}.items (items missing type)`);
+    } else {
+      violations.push(...findArrayWithoutItems(node.items, [...path, 'items']));
+    }
+  }
+  if (node.properties && typeof node.properties === 'object') {
+    for (const [k, child] of Object.entries(node.properties)) {
+      violations.push(...findArrayWithoutItems(child as SchemaNode, [...path, k]));
+    }
+  }
+  return violations;
+}
+
+describe('builtin resolver schemas — structural array-items guard', () => {
+  // Explicit-import list. getDefaultRegistry() returns an empty registry
+  // until commands/resolvers.ts registers, so walking it would silently
+  // pass with zero resolvers visited (codex finding).
+  const builtins = [
+    { name: 'url_reachable', resolver: urlReachableResolver },
+    { name: 'x_handle_to_tweet', resolver: xHandleToTweetResolver },
+  ];
+
+  for (const { name, resolver } of builtins) {
+    test(`${name}: inputSchema has no bare arrays`, () => {
+      const violations = findArrayWithoutItems(
+        resolver.inputSchema as SchemaNode | undefined,
+        [name, 'inputSchema'],
+      );
+      expect(violations).toEqual([]);
+    });
+
+    test(`${name}: outputSchema has no bare arrays`, () => {
+      const violations = findArrayWithoutItems(
+        resolver.outputSchema as SchemaNode | undefined,
+        [name, 'outputSchema'],
+      );
+      expect(violations).toEqual([]);
+    });
+  }
+
+  test('x_handle_to_tweet candidates declares full item shape with required + additionalProperties:false', () => {
+    const out = xHandleToTweetResolver.outputSchema as SchemaNode;
+    const candidates = (out.properties as Record<string, SchemaNode>).candidates;
+    expect(candidates.type).toBe('array');
+    expect(candidates.items).toBeDefined();
+    const items = candidates.items as SchemaNode;
+    expect(items.type).toBe('object');
+    expect(items.properties).toBeDefined();
+    const props = items.properties as Record<string, SchemaNode>;
+    expect(Object.keys(props).sort()).toEqual(
+      ['created_at', 'score', 'text', 'tweet_id', 'url'],
+    );
+    expect((items as { required?: unknown }).required).toEqual(
+      ['tweet_id', 'text', 'created_at', 'score', 'url'],
+    );
+    expect((items as { additionalProperties?: unknown }).additionalProperties).toBe(false);
+  });
+
+  test('coverage: at least 2 builtins walked (catches future regression where registry import drops)', () => {
+    // Negative guard against codex's "underspecified registry walk" finding:
+    // if this list ever empties (e.g. an autoformatter drops the array),
+    // the rest of the suite would silently pass.
+    expect(builtins.length).toBeGreaterThanOrEqual(2);
   });
 });
