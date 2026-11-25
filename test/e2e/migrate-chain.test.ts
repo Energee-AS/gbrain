@@ -17,7 +17,7 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import postgres from 'postgres';
+import postgres from '#postgres'
 import {
   hasDatabase,
   setupDB,
@@ -35,8 +35,8 @@ const describeE2E = SKIP ? describe.skip : describe;
 
 describeE2E('PR #356 — post-migration schema invariants (v15→v23 end state)', () => {
   beforeAll(async () => {
-    await setupDB();
-  });
+    await setupDB({ replayMigrations: true });
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -86,18 +86,14 @@ describeE2E('PR #356 — post-migration schema invariants (v15→v23 end state)'
     expect(names).toEqual(['error', 'file_id', 'status', 'storage_path_new', 'storage_path_old', 'updated_at']);
   });
 
-  // Note: config.version is truncated by setupDB's ALL_TABLES list so we
-  // can't assert it reached LATEST here. The schema-invariant tests above
-  // (composite unique present, old FK gone, page_id column, ledger table)
-  // are the real proof that the v15→v23 chain's DDL ran to completion.
 });
 
 describeE2E('PR #356 — doctor --locks detects real idle-in-transaction connections', () => {
   let secondary: ReturnType<typeof postgres> | null = null;
 
   beforeAll(async () => {
-    await setupDB();
-  });
+    await setupDB({ replayMigrations: true });
+  }, 30_000);
   afterAll(async () => {
     if (secondary) {
       try { await secondary.end({ timeout: 2 }); } catch { /* ignore */ }
@@ -148,8 +144,8 @@ describeE2E('PR #356 — doctor --locks detects real idle-in-transaction connect
 
 describeE2E('PR #356 — runMigrationsUpTo + setConfigVersion helpers', () => {
   beforeAll(async () => {
-    await setupDB();
-  });
+    await setupDB({ replayMigrations: true });
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });
@@ -184,8 +180,8 @@ describeE2E('PR #356 — runMigrationsUpTo + setConfigVersion helpers', () => {
 
 describeE2E('PR #356 — withReservedConnection round-trip', () => {
   beforeAll(async () => {
-    await setupDB();
-  });
+    await setupDB({ replayMigrations: true });
+  }, 30_000);
   afterAll(async () => {
     await teardownDB();
   });

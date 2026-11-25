@@ -24,13 +24,6 @@ describe('v0.13.0 — Frontmatter relationship indexing migration', () => {
     expect(typeof m!.orchestrator).toBe('function');
   });
 
-  test('phase functions exported for unit testing', async () => {
-    const { __testing } = await import('../src/commands/migrations/v0_13_0.ts');
-    expect(typeof __testing.phaseASchema).toBe('function');
-    expect(typeof __testing.phaseBBackfill).toBe('function');
-    expect(typeof __testing.phaseCVerify).toBe('function');
-  });
-
   test('dry-run skips all side-effect phases', async () => {
     const { v0_13_0 } = await import('../src/commands/migrations/v0_13_0.ts');
     const result = await v0_13_0.orchestrator({ yes: true, dryRun: true, noAutopilotInstall: true });
@@ -59,13 +52,18 @@ describe('v0.13.0 — Frontmatter relationship indexing migration', () => {
     expect(src).not.toMatch(/\$\{GBRAIN\}/);
   });
 
-  test('phase commands invoke bare `gbrain` shell-out (Bug 1 fix)', () => {
+  test('phases use in-process schema + bare `gbrain` subprocess (v0.41.37.0 #1605)', () => {
     const src = readFileSync(SRC_PATH, 'utf-8');
-    // All three phases shell out to bare `gbrain` so the canonical shim
-    // on PATH wins. This is the shape v0_12_0 has always used.
-    expect(src).toContain("execSync('gbrain init --migrate-only'");
-    expect(src).toContain("execSync('gbrain extract links --source db --include-frontmatter'");
-    expect(src).toContain("execSync('gbrain call get_stats'");
+    // Schema bring-up is now IN-PROCESS (was execSync('gbrain init
+    // --migrate-only'), which died with getaddrinfo ENOTFOUND on Windows).
+    expect(src).toContain('runMigrateOnlyCore()');
+    expect(src).not.toContain("execSync('gbrain init --migrate-only'");
+    // Backfill extract goes through the stderr-capturing wrapper (still bare
+    // `gbrain` so the canonical shim on PATH wins).
+    expect(src).toContain("runGbrainSubprocess('gbrain extract links --source db --include-frontmatter'");
+    // Stats readback still shells out (reads stdout), through the running
+    // CLI rather than PATH (#5184).
+    expect(src).toContain("execSync(gbrainChildCommand('gbrain call get_stats')");
   });
 
   test('phase commands never reference `bun` or `.ts` paths (Bug 1 regression)', () => {

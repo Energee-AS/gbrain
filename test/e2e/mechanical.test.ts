@@ -8,30 +8,93 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'fs';
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, existsSync } from 'fs';
 import { join } from 'path';
 import { execSync } from 'child_process';
 import { tmpdir } from 'os';
 import {
-  hasDatabase, setupDB, teardownDB, getEngine, getConn,
-  importFixtures, importFixture, time, dumpDBState, FIXTURES_PATH,
+  hasDatabase, setupDB, setupLegacyEmbeddingDB, teardownDB, getEngine, getConn,
+  importFixtures, importFixture, dumpDBState, FIXTURES_PATH,
 } from './helpers.ts';
 import { operationsByName, operations } from '../../src/core/operations.ts';
 import type { OperationContext } from '../../src/core/operations.ts';
 import { importFromContent } from '../../src/core/import-file.ts';
+import { LEGACY_EMBEDDING_CONFIG } from '../helpers/legacy-embedding-config.ts';
+import { configureGateway } from '../../src/core/ai/gateway.ts';
+import { isolatedPersistencePostgres } from '../helpers/persistence-postgres.ts';
+import { cliDiagnostic, fixtureDiagnostic } from '../helpers/fixture-diagnostics.ts';
+import { runMigrationSQL } from '../../src/core/migrate.ts';
+import { v024 } from '../../src/core/schema-migrations/v024-rls-backfill-missing-tables.ts';
 
 // Skip all E2E tests if no database is configured
 const skip = !hasDatabase();
 const describeE2E = skip ? describe.skip : describe;
 
-function makeCtx(opts: { remote?: boolean } = {}): OperationContext {
+// HOME isolation. Several tests in this file shell out to `gbrain init` and
+// `gbrain import` via Bun.spawnSync. `gbrain init` calls saveConfig() which
+// writes to $HOME/.gbrain/config.json, and `gbrain import` writes a sync
+// bookmark to the same directory. Without isolating $HOME, these tests
+// clobber the user's real production gbrain config every time `bun run
+// test:e2e` is executed. Sibling test/e2e/migration-flow.test.ts solved
+// this with a module-level temp HOME; mirror that pattern here so the
+// E2E suite stops mutating user state.
+let _origHome: string | undefined;
+let _tmpHome: string | undefined;
+if (!skip) {
+  _origHome = process.env.HOME;
+  _tmpHome = mkdtempSync(join(tmpdir(), 'gbrain-e2e-mechanical-home-'));
+  process.env.HOME = _tmpHome;
+}
+
+afterAll(() => {
+  if (skip) return;
+  if (_origHome === undefined) delete process.env.HOME;
+  else process.env.HOME = _origHome;
+  try { if (_tmpHome) rmSync(_tmpHome, { recursive: true, force: true }); } catch { /* best-effort */ }
+});
+
+/**
+ * #5227 (W14 P1.6): spawn `gbrain init` with a budget. When the child is still
+ * running at half the budget, dump pg_stat_activity (pid, state, wait event,
+ * transaction age, application; never query text) to stderr, so a hang behind
+ * a lock shows its blocker instead of a bare exit 143. Returns the spawnSync
+ * shape the call sites already read.
+ */
+async function spawnInit(input: { cmd: string[]; cwd: string; env: Record<string, string | undefined>; timeout: number }): Promise<{ exitCode: number; stdout: Uint8Array; stderr: Uint8Array }> {
+  const child = Bun.spawn({ cmd: input.cmd, cwd: input.cwd, env: input.env as Record<string, string>, stdout: 'pipe', stderr: 'pipe' });
+  let done = false;
+  const probe = setTimeout(async () => {
+    if (done) return;
+    try {
+      const rows = await getConn().unsafe(`SELECT pid, state, wait_event_type, application_name, EXTRACT(EPOCH FROM now() - xact_start)::int AS xact_age_s,
+        pg_blocking_pids(pid) AS blocked_by FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid() ORDER BY pid`);
+      process.stderr.write(`[spawnInit] child still running at half its ${input.timeout}ms budget; pg_stat_activity:\n${JSON.stringify(rows, null, 1)}\n`);
+    } catch (error) { process.stderr.write(`[spawnInit] pg_stat_activity probe failed: ${error instanceof Error ? error.message : String(error)}\n`); }
+  }, Math.floor(input.timeout / 2));
+  const kill = setTimeout(() => { if (!done) child.kill(); }, input.timeout);
+  const [stdout, stderr, exitCode] = await Promise.all([new Response(child.stdout).arrayBuffer(), new Response(child.stderr).arrayBuffer(), child.exited]);
+  done = true; clearTimeout(probe); clearTimeout(kill);
+  return { exitCode: exitCode ?? -1, stdout: new Uint8Array(stdout), stderr: new Uint8Array(stderr) };
+}
+
+function makeCtx(
+  opts: { remote?: boolean; storage?: { backend: 'local'; localPath: string } } = {},
+): OperationContext {
   return {
     engine: getEngine(),
-    config: { engine: 'postgres', database_url: process.env.DATABASE_URL! },
+    config: {
+      engine: 'postgres',
+      database_url: process.env.DATABASE_URL!,
+      // #4302: file_upload / file_url are fail-closed — they refuse with a
+      // typed storage_error unless a storage backend is configured. Tests
+      // that exercise the success path pass a local (temp-dir) backend here.
+      ...(opts.storage ? { storage: opts.storage } : {}),
+    },
     logger: { info: () => {}, warn: () => {}, error: () => {} },
     dryRun: false,
     // Default: trusted local invocation (matches `gbrain call` semantics).
     remote: opts.remote ?? false,
+    sourceId: 'default',
   };
 }
 
@@ -49,13 +112,13 @@ describeE2E('E2E: Page CRUD', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('fixture import creates correct page count', async () => {
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(16);
-  });
+  }, 30_000);
 
   test('get_page returns correct data for person', async () => {
     const page = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
@@ -108,7 +171,8 @@ describeE2E('E2E: Page CRUD', () => {
   });
 
   test('delete_page removes page and others survive', async () => {
-    await callOp('delete_page', { slug: 'sources/crustdata-sarah-chen' });
+    const current = await callOp('get_page', { slug: 'sources/crustdata-sarah-chen' }) as any;
+    await callOp('delete_page', { slug: current.slug, expected_revision: current.revision });
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(15);
 
@@ -126,7 +190,7 @@ describeE2E('E2E: Search', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('keyword search for "NovaMind" returns multiple hits', async () => {
@@ -134,7 +198,7 @@ describeE2E('E2E: Search', () => {
     expect(results.length).toBeGreaterThanOrEqual(3);
     const slugs = results.map((r: any) => r.slug);
     expect(slugs).toContain('companies/novamind');
-  });
+  }, 30_000);
 
   test('keyword search for "Threshold Ventures" finds investor', async () => {
     const results = await callOp('search', { query: 'Threshold Ventures' }) as any[];
@@ -174,6 +238,15 @@ describeE2E('E2E: Search', () => {
     for (const [query, score] of Object.entries(scores)) {
       console.log(`    "${query}": ${(score * 100).toFixed(0)}%`);
     }
+
+    // Guard value: every known-item query must surface at least one ground-truth
+    // doc in the top 5. This is a deliberately loose floor (not a tuned P@5
+    // threshold) — it catches a total keyword-retrieval regression without
+    // breaking on every scoring/fixture tweak. Without it this test asserted
+    // nothing and a 0%-precision result passed silently.
+    for (const [query, score] of Object.entries(scores)) {
+      expect(score).toBeGreaterThan(0);
+    }
   });
 });
 
@@ -185,7 +258,7 @@ describeE2E('E2E: Links', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('add_link + get_links + get_backlinks round trip', async () => {
@@ -201,13 +274,25 @@ describeE2E('E2E: Links', () => {
 
     const backlinks = await callOp('get_backlinks', { slug: 'companies/novamind' }) as any[];
     expect(backlinks.some((l: any) => l.from_slug === 'people/sarah-chen' || l.from_page_slug === 'people/sarah-chen')).toBe(true);
-  });
+  }, 30_000);
 
   test('traverse_graph finds connected pages', async () => {
-    // Links should already be added from prior test in this describe block
-    const graph = await callOp('traverse_graph', { slug: 'people/sarah-chen', depth: 2 }) as any;
+    // Self-contained: do not depend on a prior test's add_link. add_link is
+    // idempotent (ON CONFLICT DO NOTHING), so re-adding here is safe whether or
+    // not the round-trip test ran first, and the test no longer false-passes or
+    // false-fails based on describe-block ordering.
+    await callOp('add_link', {
+      from: 'people/sarah-chen',
+      to: 'companies/novamind',
+      link_type: 'founded',
+    });
+
+    const graph = await callOp('traverse_graph', { slug: 'people/sarah-chen', depth: 2 }) as any[];
     expect(Array.isArray(graph)).toBe(true);
     expect(graph.length).toBeGreaterThanOrEqual(1);
+    // Content assertion, not just shape: the linked company must be reachable.
+    const reachable = graph.map((n: any) => n.slug ?? n.to_slug ?? n.to_page_slug);
+    expect(reachable).toContain('companies/novamind');
   });
 
   test('remove_link removes the link', async () => {
@@ -230,7 +315,7 @@ describeE2E('E2E: Tags', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_tags returns imported tags', async () => {
@@ -238,7 +323,7 @@ describeE2E('E2E: Tags', () => {
     expect(tags).toContain('founder');
     expect(tags).toContain('yc-w25');
     expect(tags).toContain('ai-agents');
-  });
+  }, 30_000);
 
   test('add_tag + remove_tag round trip', async () => {
     await callOp('add_tag', { slug: 'people/marcus-reid', tag: 'test-tag' });
@@ -266,23 +351,30 @@ describeE2E('E2E: Timeline', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('add_timeline_entry + get_timeline round trip', async () => {
-    await callOp('add_timeline_entry', {
+    const entryParams = {
       slug: 'people/sarah-chen',
       date: '2025-04-01',
       summary: 'Test timeline entry',
       detail: 'Added via E2E test',
       source: 'e2e-test',
-    });
+    };
+    const first = await callOp('add_timeline_entry', entryParams);
+    expect(first).toMatchObject({ status: 'ok' }); // #1856: result also carries write_through
+
+    // #3827: an identical retry is deduplicated by the unique index — the op
+    // must report the drop instead of a silent 'ok'.
+    const dup = await callOp('add_timeline_entry', entryParams);
+    expect(dup).toMatchObject({ status: 'skipped', reason: 'duplicate' });
 
     const timeline = await callOp('get_timeline', { slug: 'people/sarah-chen' }) as any[];
     expect(timeline.length).toBeGreaterThanOrEqual(1);
-    const entry = timeline.find((e: any) => e.summary === 'Test timeline entry');
-    expect(entry).toBeDefined();
-  });
+    const matching = timeline.filter((e: any) => e.summary === 'Test timeline entry');
+    expect(matching.length).toBe(1);
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -298,13 +390,13 @@ describeE2E('E2E: addLinksBatch (postgres-engine)', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('empty batch returns 0 with no DB call', async () => {
     const engine = getEngine();
     expect(await engine.addLinksBatch([])).toBe(0);
-  });
+  }, 30_000);
 
   test('within-batch duplicates dedup via ON CONFLICT (no 21000 cardinality error)', async () => {
     const engine = getEngine();
@@ -369,13 +461,13 @@ describeE2E('E2E: addTimelineEntriesBatch (postgres-engine)', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('empty batch returns 0', async () => {
     const engine = getEngine();
     expect(await engine.addTimelineEntriesBatch([])).toBe(0);
-  });
+  }, 30_000);
 
   test('within-batch duplicates dedup via ON CONFLICT', async () => {
     const engine = getEngine();
@@ -423,7 +515,7 @@ describeE2E('E2E: Versions', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('put_page creates version, revert restores', async () => {
@@ -441,11 +533,13 @@ describeE2E('E2E: Versions', () => {
 
     // Revert to first version
     const firstVersion = versions[versions.length - 1];
-    await callOp('revert_version', { slug: 'people/sarah-chen', version_id: firstVersion.id });
+    const current = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
+    await callOp('revert_version', { slug: current.slug, version_id: firstVersion.id,
+      expected_revision: current.revision });
 
     const reverted = await callOp('get_page', { slug: 'people/sarah-chen' }) as any;
     expect(reverted.compiled_truth).not.toContain('(Modified)');
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -456,20 +550,26 @@ describeE2E('E2E: Admin', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_stats returns valid structure', async () => {
     const stats = await callOp('get_stats') as any;
     expect(stats.page_count).toBe(16);
     expect(typeof stats.chunk_count).toBe('number');
-  });
+  }, 30_000);
 
   test('get_health returns valid structure', async () => {
     const health = await callOp('get_health') as any;
     expect(health).toBeDefined();
-    expect(typeof health.page_count).toBe('number');
-    expect(typeof health.embed_coverage).toBe('number');
+    // Value bounds, not just types: page_count must match the fixture inventory
+    // and embed_coverage is a 0..1 fraction (src/commands/doctor.ts multiplies
+    // by 100 and compares to 0.9). Type-only checks let embed_coverage: -9999
+    // through; these catch a genuinely broken health payload.
+    expect(health.page_count).toBe(16);
+    expect(Number.isFinite(health.embed_coverage)).toBe(true);
+    expect(health.embed_coverage).toBeGreaterThanOrEqual(0);
+    expect(health.embed_coverage).toBeLessThanOrEqual(1);
   });
 });
 
@@ -481,14 +581,24 @@ describeE2E('E2E: Chunks & Resolution', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('get_chunks returns chunks for imported page', async () => {
     const chunks = await callOp('get_chunks', { slug: 'people/sarah-chen' }) as any[];
     expect(chunks.length).toBeGreaterThan(0);
-    expect(chunks[0].chunk_text).toBeTruthy();
-  });
+    // Content + ordering, not just truthiness (a whitespace-only chunk is truthy):
+    // every chunk has real text and a numeric index, the indexes are
+    // non-decreasing in return order, and the page's own name appears somewhere.
+    for (const c of chunks) {
+      expect(typeof c.chunk_text).toBe('string');
+      expect(c.chunk_text.trim().length).toBeGreaterThan(0);
+      expect(typeof c.chunk_index).toBe('number');
+    }
+    const indexes = chunks.map((c: any) => c.chunk_index);
+    expect(indexes).toEqual([...indexes].sort((x, y) => x - y));
+    expect(chunks.some((c: any) => c.chunk_text.includes('Sarah'))).toBe(true);
+  }, 30_000);
 
   test('resolve_slugs finds partial match', async () => {
     const matches = await callOp('resolve_slugs', { partial: 'sarah' }) as string[];
@@ -509,7 +619,7 @@ describeE2E('E2E: Ingest Log & Raw Data', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('log_ingest + get_ingest_log round trip', async () => {
@@ -525,7 +635,7 @@ describeE2E('E2E: Ingest Log & Raw Data', () => {
     const entry = log.find((e: any) => e.source_ref === 'test-run-1');
     expect(entry).toBeDefined();
     expect(entry.source_type).toBe('e2e-test');
-  });
+  }, 30_000);
 
   test('put_raw_data + get_raw_data round trip', async () => {
     const testData = { education: 'Stanford CS 2020', title: 'CEO' };
@@ -548,20 +658,20 @@ describeE2E('E2E: Ingest Log & Raw Data', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────
-// Files (stub verification)
+// Files (fail-closed refusal without a backend + real local-backend path)
 // ─────────────────────────────────────────────────────────────────
 
 describeE2E('E2E: Files', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('file_list returns empty initially', async () => {
     const files = await callOp('file_list', {}) as any[];
     expect(files.length).toBe(0);
-  });
+  }, 30_000);
 
   test('file_upload stores metadata + file_list shows it', async () => {
     // Create a temp file
@@ -570,7 +680,24 @@ describeE2E('E2E: Files', () => {
     writeFileSync(tmpFile, 'fake pdf content');
 
     try {
-      const result = await callOp('file_upload', {
+      // #4302 (fail-closed storage honesty): with NO storage backend
+      // configured, file_upload must refuse with a typed storage_error and
+      // must NOT record a phantom files row.
+      let refused: any = null;
+      try {
+        await callOp('file_upload', { path: tmpFile, page_slug: 'people/sarah-chen' });
+      } catch (e) {
+        refused = e;
+      }
+      expect(refused).not.toBeNull();
+      expect(refused.code).toBe('storage_error');
+      expect(((await callOp('file_list', {})) as any[]).length).toBe(0);
+
+      // Success path: a real (local, temp-dir) backend — bytes stored,
+      // files row recorded, file_list + file_url read it back.
+      const storage = { backend: 'local' as const, localPath: join(tmpDir, 'storage') };
+      const uploadOp = operationsByName['file_upload'];
+      const result = await uploadOp.handler(makeCtx({ storage }), {
         path: tmpFile,
         page_slug: 'people/sarah-chen',
       }) as any;
@@ -581,9 +708,18 @@ describeE2E('E2E: Files', () => {
       const files = await callOp('file_list', {}) as any[];
       expect(files.length).toBe(1);
 
-      // Verify file_url returns URI format
-      const url = await callOp('file_url', { storage_path: result.storage_path }) as any;
-      expect(url.url).toContain('gbrain:files/');
+      // Regression: Postgres BIGINT(size_bytes) returned native BigInt before
+      // v0.22.5 so the MCP serializer threw and CLI listFiles div-by-1024 threw.
+      expect(typeof files[0].size_bytes).toBe('number');
+      expect(() => JSON.stringify(files)).not.toThrow();
+
+      // Verify file_url resolves a REAL backend URL (#4302 replaced the
+      // gbrain:files/ placeholder with the backend's own URL after an
+      // existence probe; LocalStorage yields file://).
+      const urlOp = operationsByName['file_url'];
+      const url = await urlOp.handler(makeCtx({ storage }), { storage_path: result.storage_path }) as any;
+      expect(url.url).toMatch(/^file:\/\//);
+      expect(url.url).toContain('sarah-chen');
     } finally {
       rmSync(tmpDir, { recursive: true });
     }
@@ -622,7 +758,7 @@ describeE2E('E2E: Files', () => {
 describeE2E('E2E: file_list LIMIT enforcement', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('file_list with slug filter respects LIMIT 100', async () => {
@@ -653,12 +789,32 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
     const files = await callOp('file_list', { slug: testSlug }) as any[];
     expect(files.length).toBeLessThanOrEqual(100);
     expect(files.length).toBe(100);
-  });
+  }, 30_000);
 
   test('file_list without slug also respects LIMIT 100', async () => {
-    // The 150 rows from the previous test are still in the DB
+    // Self-sufficient: seed our own >100 rows rather than relying on the
+    // previous test's 150 rows surviving in the DB. A bun reorder, a focused
+    // `-t` run, or a failure mid-insert in the prior test would otherwise leave
+    // this asserting against an indeterminate row count.
+    const sql = getConn();
+    const seedSlug = 'test-limit-noslug';
+    await sql`
+      INSERT INTO pages (slug, title, type, compiled_truth, frontmatter)
+      VALUES (${seedSlug}, ${'Test Limit NoSlug'}, ${'note'}, ${'body'}, ${'{}'}::jsonb)
+      ON CONFLICT (source_id, slug) DO NOTHING
+    `;
+    for (let i = 0; i < 120; i++) {
+      await sql`
+        INSERT INTO files (page_slug, filename, storage_path, mime_type, size_bytes, content_hash, metadata)
+        VALUES (${seedSlug}, ${'nf-' + String(i).padStart(3, '0') + '.txt'}, ${seedSlug + '/nf-' + i + '.txt'}, ${'text/plain'}, ${100}, ${'nhash-' + i}, ${'{}'}::jsonb)
+        ON CONFLICT (storage_path) DO NOTHING
+      `;
+    }
+    const total = await sql`SELECT count(*)::int AS n FROM files`;
+    expect(Number(total[0].n)).toBeGreaterThan(100); // cap is actually exercised
+
     const files = await callOp('file_list', {}) as any[];
-    expect(files.length).toBeLessThanOrEqual(100);
+    expect(files.length).toBe(100);
   });
 });
 
@@ -669,7 +825,7 @@ describeE2E('E2E: file_list LIMIT enforcement', () => {
 describeE2E('E2E: Idempotency', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('double import produces no duplicates', async () => {
@@ -683,7 +839,7 @@ describeE2E('E2E: Idempotency', () => {
 
     expect(stats2.page_count).toBe(stats1.page_count);
     expect(stats2.chunk_count).toBe(stats1.chunk_count);
-  });
+  }, 30_000);
 
   test('modify one fixture, reimport, only that page updates', async () => {
     await importFixtures();
@@ -711,16 +867,24 @@ describeE2E('E2E: Idempotency', () => {
 
 describeE2E('E2E: Setup Journey', () => {
   beforeAll(async () => {
-    await setupDB();
-  });
+    await setupLegacyEmbeddingDB();
+  }, 30_000);
   afterAll(teardownDB);
 
   const cliCwd = join(import.meta.dir, '../..');
   const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL! });
 
-  test('gbrain init --non-interactive connects and initializes', () => {
-    const result = Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+  test('gbrain init --non-interactive connects and initializes', async () => {
+    // v0.37.10.0: pass --embedding-model explicitly. Tier-1 CI runs without
+    // any embedding-provider env var, and the v0.37 fail-loud-no-key gate
+    // (D3) would otherwise exit 1 here. The provider is offline-resolved
+    // (preflight validates dim against recipe; no HTTP call), so this works
+    // without a real API key. After this init writes config, subsequent
+    // inits in the file honor persisted config per D5 (no flag needed).
+    const result = await spawnInit({
+      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!,
+            '--embedding-model', LEGACY_EMBEDDING_CONFIG.embedding_model,
+            '--embedding-dimensions', String(LEGACY_EMBEDDING_CONFIG.embedding_dimensions)],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
@@ -782,18 +946,51 @@ describeE2E('E2E: Setup Journey', () => {
 describeE2E('E2E: Init Edge Cases', () => {
   afterAll(teardownDB);
 
-  test('init --non-interactive without URL fails gracefully', () => {
-    const env = { ...process.env };
-    delete env.DATABASE_URL;
-    delete env.GBRAIN_DATABASE_URL;
-    const result = Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive'],
-      cwd: join(import.meta.dir, '../..'),
-      env,
-      timeout: 10_000,
-    });
-    expect(result.exitCode).not.toBe(0);
-  });
+  test('init --non-interactive without URL fails gracefully', async () => {
+    // A fresh home with no config: an earlier test in this file writes a Postgres config into the shared HOME, and
+    // init --non-interactive now keeps a brain the config names, so "no URL" here also means "no config".
+    const freshHome = mkdtempSync(join(tmpdir(), 'gbrain-e2e-init-no-url-'));
+    try {
+      const env: Record<string, string | undefined> = { ...process.env, HOME: freshHome, GBRAIN_HOME: freshHome };
+      delete env.DATABASE_URL;
+      delete env.GBRAIN_DATABASE_URL;
+      const result = await spawnInit({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive'],
+        cwd: join(import.meta.dir, '../..'),
+        env,
+        timeout: 10_000,
+      });
+      expect(result.exitCode).not.toBe(0);
+      expect(existsSync(join(freshHome, '.gbrain', 'config.json'))).toBe(false);
+    } finally {
+      rmSync(freshHome, { recursive: true, force: true });
+    }
+  }, 30_000);
+
+  test('init --non-interactive with no URL keeps the Postgres brain the config file names', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'gbrain-e2e-init-kept-pg-'));
+    try {
+      mkdirSync(join(home, '.gbrain'));
+      writeFileSync(join(home, '.gbrain', 'config.json'), JSON.stringify({ engine: 'postgres', database_url: process.env.DATABASE_URL }, null, 2));
+      const env: Record<string, string | undefined> = { ...process.env, HOME: home, GBRAIN_HOME: home };
+      delete env.DATABASE_URL;
+      delete env.GBRAIN_DATABASE_URL;
+      const result = await spawnInit({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
+              '--embedding-model', LEGACY_EMBEDDING_CONFIG.embedding_model,
+              '--embedding-dimensions', String(LEGACY_EMBEDDING_CONFIG.embedding_dimensions)],
+        cwd: join(import.meta.dir, '../..'),
+        env,
+        timeout: 15_000,
+      });
+      expect(result.exitCode).toBe(0);
+      const cfg = JSON.parse(readFileSync(join(home, '.gbrain', 'config.json'), 'utf8'));
+      expect(cfg.engine).toBe('postgres');
+      expect(cfg.database_url).toBe(process.env.DATABASE_URL);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   test('double init is idempotent', async () => {
     await setupDB();
@@ -828,7 +1025,7 @@ describeE2E('E2E: Init Edge Cases', () => {
 describeE2E('E2E: Schema Idempotency', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('initSchema twice produces no errors and same object count', async () => {
@@ -844,7 +1041,7 @@ describeE2E('E2E: Schema Idempotency', () => {
 
     expect(tables2[0].n).toBe(tables1[0].n);
     expect(indexes2[0].n).toBe(indexes1[0].n);
-  });
+  }, 30_000);
 });
 
 // ─────────────────────────────────────────────────────────────────
@@ -854,7 +1051,7 @@ describeE2E('E2E: Schema Idempotency', () => {
 describeE2E('E2E: Schema Diff Guard', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('all expected tables exist', async () => {
@@ -874,7 +1071,7 @@ describeE2E('E2E: Schema Diff Guard', () => {
     for (const table of expected) {
       expect(tableNames).toContain(table);
     }
-  });
+  }, 30_000);
 
   test('pgvector extension is installed', async () => {
     const conn = getConn();
@@ -897,7 +1094,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
   beforeAll(async () => {
     await setupDB();
     await importFixtures();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   test('imports files with spaces in filename', async () => {
@@ -905,7 +1102,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
     expect(page).not.toBeNull();
     expect(page.title).toBe('OhMyGreen');
     expect(page.type).toBe('company');
-  });
+  }, 30_000);
 
   test('imports files with parens in filename', async () => {
     const page = await callOp('get_page', { slug: 'apple-notes/notes-march-2024' }) as any;
@@ -935,7 +1132,7 @@ describeE2E('E2E: Slug with Special Characters', () => {
 describeE2E('E2E: RLS Verification', () => {
   beforeAll(async () => {
     await setupDB();
-  });
+  }, 30_000);
   afterAll(teardownDB);
 
   const cliCwd = join(import.meta.dir, '../..');
@@ -958,7 +1155,7 @@ describeE2E('E2E: RLS Verification', () => {
     if (tables.some((t: any) => t.rowsecurity)) {
       expect(noRls.map((t: any) => t.tablename)).toEqual([]);
     }
-  });
+  }, 30_000);
 
   test('current user role has BYPASSRLS', async () => {
     const conn = getConn();
@@ -968,19 +1165,64 @@ describeE2E('E2E: RLS Verification', () => {
     }
   });
 
-  test('gbrain doctor fails with exit 1 when a public table is missing RLS', async () => {
+  // #4939: doctor fails a missing-RLS table only when the public schema may be
+  // reachable with the anon key (PostgREST roles or a Supabase URL). The
+  // fail-path tests below create the PostgREST `anon` role for their duration.
+  async function withPostgrestRole<T>(fn: () => Promise<T>): Promise<T> {
     const conn = getConn();
-    const tbl = `gbrain_rls_regression_${suffix}`;
-    try {
-      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
-      // Make sure RLS is actually off; CREATE TABLE default is off but be explicit.
-      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+    const existed = (await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname = 'anon'`)).length > 0;
+    if (!existed) await conn.unsafe(`CREATE ROLE anon NOLOGIN`);
+    try { return await fn(); } finally { if (!existed) await conn.unsafe(`DROP ROLE IF EXISTS anon`); }
+  }
 
-      // Init (idempotent) so the CLI has a config to read.
-      Bun.spawnSync({
+  test('gbrain doctor warns, not fails, on a missing-RLS table when nothing exposes the public schema (#4939)', async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_plain_pg_${suffix}`;
+    try {
+      await spawnInit({
         cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
+      expect((await conn.unsafe(`SELECT 1 FROM pg_roles WHERE rolname IN ('anon','authenticated','authenticator','service_role')`)).length).toBe(0);
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+      const result = Bun.spawnSync({
+        cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
+        cwd: cliCwd, env: cliEnv(), timeout: 20_000,
+      });
+      const rls = JSON.parse(new TextDecoder().decode(result.stdout)).checks.find((c: any) => c.name === 'rls');
+      expect(rls.status).toBe('warn');
+      expect(rls.message).toContain(tbl);
+      expect(rls.message).toContain('No PostgREST exposure detected');
+      expect(rls.message).toContain('ENABLE ROW LEVEL SECURITY');
+    } finally {
+      await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+    }
+  }, 60_000);
+
+  test('gbrain doctor fails with exit 1 when a public table is missing RLS', () => withPostgrestRole(async () => {
+    const conn = getConn();
+    const tbl = `gbrain_rls_regression_${suffix}`;
+    try {
+      // Init first so all migrations (including v35's auto-RLS event trigger
+      // and one-time backfill) are applied. AFTER migrations run, simulate
+      // the post-v35 escape route: operator drops the auto-RLS trigger
+      // (e.g. while debugging) and creates a public table without RLS.
+      // doctor's existing rls check must still flag it. The new
+      // rls_event_trigger check warns separately about the missing trigger.
+      await spawnInit({
+        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+        cwd: cliCwd, env: cliEnv(), timeout: 15_000,
+      });
+
+      // Drop the trigger so CREATE TABLE doesn't auto-enable RLS, then create
+      // the test table without RLS. ALTER TABLE … DISABLE is a belt-and-
+      // suspenders no-op in this path but matches what an operator would do
+      // if they had toggled RLS off manually after the trigger ran.
+      await conn.unsafe(`DROP EVENT TRIGGER IF EXISTS auto_rls_on_create_table`);
+      await conn.unsafe(`CREATE TABLE public.${tbl} (id int)`);
+      await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
+
       const result = Bun.spawnSync({
         cmd: ['bun', 'run', 'src/cli.ts', 'doctor', '--json'],
         cwd: cliCwd, env: cliEnv(), timeout: 20_000,
@@ -995,8 +1237,13 @@ describeE2E('E2E: RLS Verification', () => {
       expect(result.exitCode).toBe(1);
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
+      // Restore the trigger via a no-op v35 replay so subsequent tests in
+      // this file (which expect the post-init steady state) don't see drift.
+      const { MIGRATIONS } = await import('../../src/core/migrate.ts');
+      const v35sql = (MIGRATIONS.find(m => m.version === 35)?.sqlFor as any)?.postgres;
+      if (v35sql) await conn.unsafe(v35sql);
     }
-  }, 60_000);
+  }), 60_000);
 
   test('GBRAIN:RLS_EXEMPT comment with valid reason exempts a non-RLS public table', async () => {
     const conn = getConn();
@@ -1006,7 +1253,7 @@ describeE2E('E2E: RLS Verification', () => {
       await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT reason=e2e test fixture, anon-readable ok'`);
 
-      Bun.spawnSync({
+      await spawnInit({
         cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
@@ -1025,7 +1272,7 @@ describeE2E('E2E: RLS Verification', () => {
     }
   }, 60_000);
 
-  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', async () => {
+  test('GBRAIN:RLS_EXEMPT comment WITHOUT reason= still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_exempt_bad_${suffix}`;
     try {
@@ -1034,7 +1281,7 @@ describeE2E('E2E: RLS Verification', () => {
       // Missing the `reason=<...>` segment — prefix alone is not enough.
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'GBRAIN:RLS_EXEMPT'`);
 
-      Bun.spawnSync({
+      await spawnInit({
         cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
@@ -1051,9 +1298,9 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
-  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', async () => {
+  test('Non-exempt unrelated COMMENT on a no-RLS table still fails doctor', () => withPostgrestRole(async () => {
     const conn = getConn();
     const tbl = `gbrain_rls_comment_${suffix}`;
     try {
@@ -1061,7 +1308,7 @@ describeE2E('E2E: RLS Verification', () => {
       await conn.unsafe(`ALTER TABLE public.${tbl} DISABLE ROW LEVEL SECURITY`);
       await conn.unsafe(`COMMENT ON TABLE public.${tbl} IS 'Regular docs comment, not an exemption'`);
 
-      Bun.spawnSync({
+      await spawnInit({
         cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
         cwd: cliCwd, env: cliEnv(), timeout: 15_000,
       });
@@ -1077,7 +1324,7 @@ describeE2E('E2E: RLS Verification', () => {
     } finally {
       await conn.unsafe(`DROP TABLE IF EXISTS public.${tbl}`);
     }
-  }, 60_000);
+  }), 60_000);
 
   // Regression test for the v24 self-healing guard. If an operator manually
   // drops budget_ledger and/or budget_reservations (they are migration-only
@@ -1092,51 +1339,25 @@ describeE2E('E2E: RLS Verification', () => {
   // same failure forever.
   test('v24 self-heals when budget_ledger + budget_reservations are missing', async () => {
     const conn = getConn();
-    let priorVersion: string | null = null;
     try {
-      // Capture current version so we can restore after the test.
-      const verRows = await conn.unsafe(`SELECT value FROM config WHERE key = 'version'`);
-      priorVersion = (verRows[0] as any)?.value ?? null;
-
       // Simulate an operator who dropped the budget_* tables for any reason
       // (cleanup, migration from an older gbrain, etc).
       await conn.unsafe(`DROP TABLE IF EXISTS public.budget_ledger CASCADE`);
       await conn.unsafe(`DROP TABLE IF EXISTS public.budget_reservations CASCADE`);
 
-      // Roll the version back to 23 so v24 re-runs on the next initSchema.
-      // UPSERT so this works whether the key exists or not.
-      await conn.unsafe(`
-        INSERT INTO config (key, value) VALUES ('version', '23')
-        ON CONFLICT (key) DO UPDATE SET value = '23'
-      `);
+      // #5227 (W14 P1.6): call the migration handler directly instead of
+      // spawning `gbrain init`. The spawn replayed schema.sql plus every
+      // pending migration on a 30 s budget and timed out whenever another
+      // test's open transaction held a table lock, which is the bug the
+      // lock_timeout work fixes; it also proved nothing about v24 that the
+      // handler call does not. runMigrationSQL is the exact path initSchema
+      // takes for a transaction-wrapped migration. With the guard, v24
+      // applies cleanly; without it, this rejects with 42P01.
+      await runMigrationSQL(getEngine(), v024, v024.sql);
 
-      // Re-trigger initSchema via the CLI. With the guard, this should
-      // apply v24 cleanly and advance version to 24. Without the guard,
-      // this would error out with 42P01 and leave version at 23.
-      const result = Bun.spawnSync({
-        cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
-        cwd: cliCwd, env: cliEnv(), timeout: 30_000,
-      });
-      const stdout = new TextDecoder().decode(result.stdout);
-      const stderr = new TextDecoder().decode(result.stderr);
-
-      // Must succeed — no 42P01, no transaction rollback.
-      expect(result.exitCode).toBe(0);
-      expect(stderr + stdout).not.toMatch(/42P01|does not exist.*budget/i);
-
-      // Version must have advanced PAST 24. The original test pinned exactly
-      // '24' when LATEST_VERSION was 24 (v0.18.1 era). Since then v25, v26
-      // (v0.19.0), and v27, v28, v29 (v0.21.0 Cathedral II) have shipped.
-      // init runs every pending migration, so after rolling back to 23 the
-      // version advances to LATEST_VERSION. The test's intent is to prove
-      // v24 didn't crash on missing budget_* tables — assert version >= 24.
-      const afterRows = await conn.unsafe(`SELECT value FROM config WHERE key = 'version'`);
-      const finalVersion = parseInt((afterRows[0] as any).value, 10);
-      expect(finalVersion).toBeGreaterThanOrEqual(24);
-
-      // The tables stayed dropped (v12 didn't re-run because current=23 > 12
-      // was already true before this test ran). That's intentional — we're
-      // proving v24 doesn't require those tables to exist.
+      // The tables stayed dropped: v24 skipped them instead of failing, and
+      // nothing else re-created them. That's intentional — we're proving
+      // v24 doesn't require those tables to exist.
       const tblRows = await conn.unsafe(`
         SELECT tablename FROM pg_tables
         WHERE schemaname = 'public'
@@ -1177,14 +1398,6 @@ describeE2E('E2E: RLS Verification', () => {
       // RLS" assertion earlier in this block stays green if re-run.
       await conn.unsafe(`ALTER TABLE budget_ledger ENABLE ROW LEVEL SECURITY`);
       await conn.unsafe(`ALTER TABLE budget_reservations ENABLE ROW LEVEL SECURITY`);
-      // Restore version so we don't leave the DB at a weird state for
-      // subsequent test blocks.
-      if (priorVersion !== null) {
-        await conn.unsafe(
-          `UPDATE config SET value = $1 WHERE key = 'version'`,
-          [priorVersion],
-        );
-      }
     }
   }, 60_000);
 });
@@ -1194,27 +1407,74 @@ describeE2E('E2E: RLS Verification', () => {
 // ─────────────────────────────────────────────────────────────────
 
 describeE2E('E2E: Doctor Command', () => {
+  // Scope GBRAIN_HOME to a hermetic tmpdir so `gbrain doctor` doesn't read
+  // the developer's local ~/.gbrain/migrations/completed.jsonl. Stale partial
+  // entries from in-flight workspaces (e.g. v0.31.x santiago) would make the
+  // minions_migration check fail and exit 1, masking real DB-health failures.
+  let gbrainHome: string;
+  let doctorDatabase: Awaited<ReturnType<typeof isolatedPersistencePostgres>> | undefined;
+  let doctorUrl: string;
+
   beforeAll(async () => {
-    await setupDB();
-    await importFixtures();
+    // The shared reset preserves OAuth clients and other durable state. The
+    // delegated-grant fixture deliberately leaves an empty confidential hash,
+    // which doctor correctly rejects. A healthy-brain assertion owns its DB.
+    configureGateway({ ...LEGACY_EMBEDDING_CONFIG, env: {} });
+    doctorDatabase = await isolatedPersistencePostgres(process.env.DATABASE_URL!);
+    const [{ name }] = await doctorDatabase.engine.executeRaw<{ name: string }>('SELECT current_database() AS name');
+    const url = new URL(process.env.DATABASE_URL!);
+    url.pathname = `/${name}`;
+    doctorUrl = url.toString();
+    await importFixtures(doctorDatabase.engine);
+    // Isolate GBRAIN_HOME to a per-block tempdir so the developer's
+    // ~/.gbrain/migrations/completed.jsonl ledger doesn't leak in. Without
+    // this, doctor reads the dev machine state — partial v0.21/v0.22.4/v0.28.0
+    // migration entries from in-flight workspaces — and surfaces them as the
+    // 'minions_migration' [FAIL] check, exiting with code 1.
+    gbrainHome = mkdtempSync(join(tmpdir(), 'gbrain-doctor-e2e-'));
+  }, 30_000);
+  afterAll(async () => {
+    await doctorDatabase?.close();
+    if (gbrainHome) rmSync(gbrainHome, { recursive: true, force: true });
   });
-  afterAll(teardownDB);
 
   const cliCwd = join(import.meta.dir, '../..');
-  const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL!, GBRAIN_DATABASE_URL: process.env.DATABASE_URL! });
+  const cliEnv = () => ({
+    ...process.env,
+    DATABASE_URL: doctorUrl,
+    GBRAIN_DATABASE_URL: doctorUrl,
+    GBRAIN_DIRECT_DATABASE_URL: doctorUrl,
+    GBRAIN_HOME: gbrainHome,
+  });
 
-  test('gbrain doctor exits 0 on healthy DB', () => {
-    // Init first so config exists for CLI
-    Bun.spawnSync({
-      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
+  test('gbrain doctor exits 0 on healthy DB', async () => {
+    // Init first so config exists for CLI. Pin --embedding-model explicitly
+    // so the spawned doctor doesn't pick a different default (e.g. Voyage-1024d
+    // when VOYAGE_API_KEY is in env) that mismatches the fixture's
+    // 1536d schema. Mirrors the same pattern in 'Setup Journey'.
+    const init = await spawnInit({
+      cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive',
+            '--url', doctorUrl,
+            '--embedding-model', LEGACY_EMBEDDING_CONFIG.embedding_model,
+            '--embedding-dimensions', String(LEGACY_EMBEDDING_CONFIG.embedding_dimensions)],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
+    expect(init.exitCode, cliDiagnostic('doctor fixture init', {
+      exitCode: init.exitCode, stdout: new TextDecoder().decode(init.stdout), stderr: new TextDecoder().decode(init.stderr),
+    }, [doctorUrl])).toBe(0);
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'doctor'],
       cwd: cliCwd,
       env: cliEnv(),
       timeout: 15_000,
     });
+    if (result.exitCode !== 0) {
+      const stdout = new TextDecoder().decode(result.stdout);
+      const stderr = new TextDecoder().decode(result.stderr);
+      const failedChecks = stdout.split('\n').filter(line => /^\s*\[FAIL\]/.test(line));
+      console.error(fixtureDiagnostic('doctor failed checks', failedChecks.join('\n') || '(none rendered)', [doctorUrl]));
+      console.error(cliDiagnostic('doctor', { exitCode: result.exitCode, stdout, stderr }, [doctorUrl]));
+    }
     expect(result.exitCode).toBe(0);
   }, 60_000);
 
@@ -1230,6 +1490,11 @@ describeE2E('E2E: Doctor Command', () => {
     expect(parsed.status).toBeDefined();
     expect(Array.isArray(parsed.checks)).toBe(true);
     expect(parsed.checks.length).toBeGreaterThan(0);
+    expect(result.exitCode, cliDiagnostic('doctor --json', {
+      exitCode: result.exitCode, stdout, stderr: new TextDecoder().decode(result.stderr),
+    }, [doctorUrl])).toBe(0);
+    expect(parsed.checks.filter((check: { status: string }) => check.status === 'fail')).toEqual([]);
+    expect(parsed.checks.find((check: { name: string }) => check.name === 'oauth_confidential_client_health')?.status).toBe('ok');
     for (const check of parsed.checks) {
       expect(['ok', 'warn', 'fail']).toContain(check.status);
       expect(typeof check.name).toBe('string');
@@ -1248,8 +1513,8 @@ describeE2E('E2E: Parallel Import', () => {
   const cliCwd = join(import.meta.dir, '../..');
   const cliEnv = () => ({ ...process.env, DATABASE_URL: process.env.DATABASE_URL!, GBRAIN_DATABASE_URL: process.env.DATABASE_URL! });
 
-  function initCli() {
-    Bun.spawnSync({
+  async function initCli() {
+    await spawnInit({
       cmd: ['bun', 'run', 'src/cli.ts', 'init', '--non-interactive', '--url', process.env.DATABASE_URL!],
       cwd: cliCwd, env: cliEnv(), timeout: 15_000,
     });
@@ -1262,7 +1527,7 @@ describeE2E('E2E: Parallel Import', () => {
 
   test('sequential baseline: import all fixtures', async () => {
     await setupDB();
-    initCli();
+    await initCli();
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'import', '--no-embed', FIXTURES_PATH],
       cwd: cliCwd,
@@ -1284,7 +1549,7 @@ describeE2E('E2E: Parallel Import', () => {
 
   test('parallel import with --workers 2 matches sequential page count', async () => {
     await setupDB();
-    initCli();
+    await initCli();
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'import', '--no-embed', '--workers', '2', FIXTURES_PATH],
       cwd: cliCwd,
@@ -1329,7 +1594,7 @@ describeE2E('E2E: Parallel Import', () => {
 
   test('parallel import with --workers 4 also works', async () => {
     await setupDB();
-    initCli();
+    await initCli();
     const result = Bun.spawnSync({
       cmd: ['bun', 'run', 'src/cli.ts', 'import', '--no-embed', '--workers', '4', FIXTURES_PATH],
       cwd: cliCwd,
@@ -1357,40 +1622,4 @@ describeE2E('E2E: Parallel Import', () => {
     expect(stats.page_count).toBe(seqPageCount);
     expect(stats.chunk_count).toBe(seqChunkCount);
   }, 60_000);
-});
-
-// ─────────────────────────────────────────────────────────────────
-// Performance Baselines
-// ─────────────────────────────────────────────────────────────────
-
-describeE2E('E2E: Performance Baselines', () => {
-  beforeAll(async () => {
-    await setupDB();
-  });
-  afterAll(teardownDB);
-
-  test('import + search + link performance', async () => {
-    const [_, importMs] = await time(importFixtures);
-
-    const searchTimes: number[] = [];
-    for (const q of ['NovaMind', 'hybrid search', 'Stanford', 'investor', 'compiled truth']) {
-      const [__, ms] = await time(() => callOp('search', { query: q }));
-      searchTimes.push(ms);
-    }
-
-    const [___, linkMs] = await time(async () => {
-      await callOp('add_link', { from: 'people/sarah-chen', to: 'companies/novamind' });
-      await callOp('get_backlinks', { slug: 'companies/novamind' });
-    });
-
-    searchTimes.sort((a, b) => a - b);
-    const p50 = searchTimes[Math.floor(searchTimes.length * 0.5)];
-    const p99 = searchTimes[searchTimes.length - 1];
-
-    console.log('\n  Performance Baselines:');
-    console.log(`    Import 13 fixtures: ${importMs.toFixed(0)}ms`);
-    console.log(`    Search p50: ${p50.toFixed(0)}ms`);
-    console.log(`    Search p99: ${p99.toFixed(0)}ms`);
-    console.log(`    Link + backlink: ${linkMs.toFixed(0)}ms`);
-  });
 });

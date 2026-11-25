@@ -2,8 +2,11 @@ import { describe, test, expect } from 'bun:test';
 import {
   buildSourceFactorCase,
   buildHardExcludeClause,
+  buildVisibilityClause,
+  escapeLikePattern as topLevelEscapeLikePattern,
   __test__,
 } from '../src/core/search/sql-ranking.ts';
+import { unverifiedExtractionFragment } from '../src/core/extraction-review.ts';
 import {
   DEFAULT_SOURCE_BOOSTS,
   DEFAULT_HARD_EXCLUDES,
@@ -85,9 +88,11 @@ describe('buildSourceFactorCase', () => {
     expect(buildSourceFactorCase('p.slug', {}, 'medium')).toBe('1.0');
   });
 
-  test('emits a CASE expression for non-high detail', () => {
+  test('emits a CASE expression for non-high detail (unverified guard first — issue #160)', () => {
     const result = buildSourceFactorCase('p.slug', { 'originals/': 1.5 }, 'medium');
-    expect(result).toBe("(CASE WHEN p.slug LIKE 'originals/%' THEN 1.5 ELSE 1.0 END)");
+    expect(result).toBe(
+      `(CASE WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'originals/%' THEN 1.5 ELSE 1.0 END)`,
+    );
   });
 
   test('sorts prefixes by length descending so longest-match wins', () => {
@@ -117,7 +122,9 @@ describe('buildSourceFactorCase', () => {
       { 'good/': 1.5, 'nan/': NaN, 'neg/': -1, 'inf/': Infinity },
       'medium',
     );
-    expect(result).toBe("(CASE WHEN p.slug LIKE 'good/%' THEN 1.5 ELSE 1.0 END)");
+    expect(result).toBe(
+      `(CASE WHEN ${unverifiedExtractionFragment('p')} THEN 1.0 WHEN p.slug LIKE 'good/%' THEN 1.5 ELSE 1.0 END)`,
+    );
   });
 
   test('uses the supplied slug column reference', () => {
@@ -162,8 +169,8 @@ describe('buildHardExcludeClause', () => {
 
 describe('parseSourceBoostEnv', () => {
   test('parses comma-separated prefix:factor pairs', () => {
-    expect(parseSourceBoostEnv('originals/:1.8,wintermute/chat/:0.3'))
-      .toEqual({ 'originals/': 1.8, 'wintermute/chat/': 0.3 });
+    expect(parseSourceBoostEnv('originals/:1.8,openclaw/chat/:0.3'))
+      .toEqual({ 'originals/': 1.8, 'openclaw/chat/': 0.3 });
   });
 
   test('returns empty object for undefined or empty', () => {
@@ -240,7 +247,7 @@ describe('resolveHardExcludes', () => {
     const r = resolveHardExcludes(undefined, ['test/'], undefined);
     expect(r).not.toContain('test/');
     // Other defaults still present.
-    expect(r).toContain('archive/');
+    expect(r).toContain('attachments/');
   });
 
   test('env GBRAIN_SEARCH_EXCLUDE adds to the union', () => {
@@ -251,5 +258,92 @@ describe('resolveHardExcludes', () => {
   test('include subtracts from env-supplied excludes too', () => {
     const r = resolveHardExcludes(undefined, ['envdir/'], 'envdir/');
     expect(r).not.toContain('envdir/');
+  });
+});
+
+// issue #1777 — archive/ moved from hard-exclude to a 0.5 source-boost demote.
+describe('archive demote (issue #1777)', () => {
+  test('archive/ is NOT a default hard-exclude (regression guard)', () => {
+    expect(DEFAULT_HARD_EXCLUDES).not.toContain('archive/');
+    // The genuine-noise prefixes stay excluded.
+    expect(DEFAULT_HARD_EXCLUDES).toContain('test/');
+    expect(DEFAULT_HARD_EXCLUDES).toContain('attachments/');
+    expect(DEFAULT_HARD_EXCLUDES).toContain('.raw/');
+  });
+
+  test('resolveHardExcludes() never includes archive/ by default', () => {
+    expect(resolveHardExcludes()).not.toContain('archive/');
+  });
+
+  test('archive/ is demoted to 0.5 in the boost map', () => {
+    expect(DEFAULT_SOURCE_BOOSTS['archive/']).toBe(0.5);
+    expect(resolveBoostMap()['archive/']).toBe(0.5);
+  });
+
+  test('buildSourceFactorCase emits an archive/ demote branch', () => {
+    const sql = buildSourceFactorCase('p.slug', resolveBoostMap(), undefined);
+    expect(sql).toContain("WHEN p.slug LIKE 'archive/%' THEN 0.5");
+  });
+
+  test('detail=high bypasses the source factor (archive ranks normally)', () => {
+    expect(buildSourceFactorCase('p.slug', resolveBoostMap(), 'high')).toBe('1.0');
+  });
+
+  test('escapeLikePattern is exported at top level (CV-3a contract)', () => {
+    expect(typeof topLevelEscapeLikePattern).toBe('function');
+    expect(topLevelEscapeLikePattern('a_b%c\\d')).toBe('a\\_b\\%c\\\\d');
+  });
+});
+
+// v0.26.5 — visibility clause for soft-deleted pages and archived sources.
+describe('buildVisibilityClause (v0.26.5)', () => {
+  test('emits visibility and current projection predicates with a leading AND', () => {
+    const clause = buildVisibilityClause('p', 's');
+    // Leading AND so callers can splice unconditionally.
+    expect(clause.startsWith('AND ')).toBe(true);
+    // Both predicates present: page-level deleted_at IS NULL + source-level NOT archived.
+    expect(clause).toContain('p.deleted_at IS NULL');
+    expect(clause).toContain('p.text_projection_revision = p.knowledge_revision');
+    expect(clause).toContain('NOT s.archived');
+    // v0.42 (#1699): also excludes quarantined pages (flagged pages stay visible).
+    expect(clause).toContain("? 'quarantine'");
+  });
+
+  test('uses the supplied aliases verbatim', () => {
+    expect(buildVisibilityClause('pp', 'src')).toBe(
+      "AND pp.deleted_at IS NULL AND ((pp.text_projection_revision = pp.knowledge_revision) IS TRUE OR (pp.text_projection_revision = '00000000-0000-0000-0000-000000000153'::uuid) IS TRUE) AND NOT src.archived AND NOT (COALESCE(pp.frontmatter, '{}'::jsonb) ? 'quarantine') AND NOT (COALESCE(pp.frontmatter, '{}'::jsonb) ? 'pinned_question')",
+    );
+  });
+
+  test('drift guard: quarantine fragment comes from quarantine.ts single source of truth', async () => {
+    // buildVisibilityClause MUST consume quarantineFilterFragment so the search
+    // filter and the marker key can't drift (#1699 maintainability finding).
+    const { quarantineFilterFragment } = await import('../src/core/quarantine.ts');
+    expect(buildVisibilityClause('p', 's')).toContain(quarantineFilterFragment('p'));
+    expect(buildVisibilityClause('xx', 's')).toContain(quarantineFilterFragment('xx'));
+  });
+
+  test('does NOT bypass on detail level — visibility is a contract, not a temporal preference', () => {
+    // Distinct from buildSourceFactorCase: there's no detail-gated short-circuit.
+    // Soft-deleted content stays hidden regardless of caller's detail level.
+    // Function signature has no detail param; the third param is the #4352
+    // excludePrivate opts bag (a tightening knob, never a bypass). This test
+    // pins that contract: exactly (pageAlias, sourceAlias, opts).
+    expect(buildVisibilityClause.length).toBe(3);
+    expect(String(buildVisibilityClause)).not.toContain('detail');
+  });
+
+  test('emits a stable string regardless of call order (idempotent for snapshot tests)', () => {
+    const a = buildVisibilityClause('p', 's');
+    const b = buildVisibilityClause('p', 's');
+    expect(a).toBe(b);
+  });
+
+  test('produces no JSONB containment in the output (column-based, not @>)', () => {
+    // Issue 5 contract: archived was promoted from JSONB key to real column.
+    // The visibility clause must not regress to JSONB containment.
+    const clause = buildVisibilityClause('p', 's');
+    expect(clause).not.toContain('@>');
+    expect(clause).not.toContain('config');
   });
 });

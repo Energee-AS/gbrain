@@ -23,6 +23,8 @@
 
 import type { BrainEngine } from '../engine.ts';
 import type { SearchResult } from '../types.ts';
+import { chunkVisibleFilter } from './safe-chunks.ts';
+import { readEdgeResolution } from '../chunkers/symbol-resolver.ts';
 
 const MAX_WALK_DEPTH = 2;
 const NEIGHBOR_CAP_PER_HOP = 50;
@@ -75,12 +77,28 @@ export async function expandAnchors(
 
   // --near-symbol: add chunks whose symbol_name_qualified matches as
   // additional anchors. Best-effort — if none found, fall through.
+  //
+  // v0.34 (Codex finding #2): when opts.sourceId is set, scope the
+  // symbol lookup to that source. Pre-v0.34 this WAS unscoped despite the
+  // TwoPassOpts.sourceId field being declared — multi-source brains
+  // cross-contaminated structural retrieval. Now: opts.sourceId set →
+  // filter; undefined → cross-source (matches the documented contract).
   if (opts.nearSymbol) {
     try {
-      const rows = await engine.executeRaw<{ id: number }>(
-        `SELECT id FROM content_chunks WHERE symbol_name_qualified = $1 LIMIT 50`,
-        [opts.nearSymbol],
-      );
+      const rows = opts.sourceId
+        ? await engine.executeRaw<{ id: number }>(
+            // chunk-visibility-ok: code symbol anchors: code pages are never segmented (chooseBodyStorage)
+            `SELECT cc.id FROM content_chunks cc
+             JOIN pages p ON p.id = cc.page_id
+             WHERE cc.symbol_name_qualified = $1 AND p.source_id = $2
+             LIMIT 50`,
+            [opts.nearSymbol, opts.sourceId],
+          )
+        : await engine.executeRaw<{ id: number }>(
+            // chunk-visibility-ok: code symbol anchors: code pages are never segmented (chooseBodyStorage)
+            `SELECT id FROM content_chunks WHERE symbol_name_qualified = $1 LIMIT 50`,
+            [opts.nearSymbol],
+          );
       const baseScore = anchors.length > 0 ? anchors[0]!.score : 1.0;
       for (const r of rows) {
         if (!seen.has(r.id)) {
@@ -114,24 +132,50 @@ export async function expandAnchors(
         continue;
       }
 
-      // Two kinds of neighbors to visit:
+      // Three kinds of neighbors to visit:
       //   1. Resolved edges with to_chunk_id: direct chunk follow.
-      //   2. Unresolved edges (code_edges_symbol): resolve by
+      //   2. Symbol edges the within-file resolver already answered:
+      //      follow the resolved chunk_id / ambiguous candidates directly
+      //      (same page as the caller). The name lookup below would pull
+      //      in EVERY file defining the symbol, the aliasing the resolver
+      //      exists to prevent.
+      //   3. Genuinely unresolved edges: resolve by
       //      symbol_name_qualified = to_symbol_qualified, then follow.
       const directChunkIds: number[] = [];
       const unresolvedTargets: string[] = [];
       for (const e of edges) {
-        if (e.to_chunk_id != null) directChunkIds.push(e.to_chunk_id);
+        if (e.to_chunk_id != null) {
+          directChunkIds.push(e.to_chunk_id);
+          continue;
+        }
+        const res = readEdgeResolution(e.edge_metadata);
+        if (res.kind === 'resolved') directChunkIds.push(res.chunk_id);
+        else if (res.kind === 'ambiguous') directChunkIds.push(...res.candidate_chunk_ids);
         else if (e.to_symbol_qualified) unresolvedTargets.push(e.to_symbol_qualified);
       }
       // Resolve unresolved edges by looking up chunks whose
       // symbol_name_qualified matches. One batch query per frontier node.
+      //
+      // v0.34 (Codex finding #2): scope by opts.sourceId when set. Pre-v0.34
+      // this lookup was unscoped, letting structural retrieval cross source
+      // boundaries silently in multi-source brains.
       if (unresolvedTargets.length > 0) {
         try {
-          const resolved = await engine.executeRaw<{ id: number }>(
-            `SELECT id FROM content_chunks WHERE symbol_name_qualified = ANY($1::text[]) LIMIT ${NEIGHBOR_CAP_PER_HOP}`,
-            [unresolvedTargets],
-          );
+          const resolved = opts.sourceId
+            ? await engine.executeRaw<{ id: number }>(
+                // chunk-visibility-ok: code symbol targets: code pages are never segmented (chooseBodyStorage)
+                `SELECT cc.id FROM content_chunks cc
+                 JOIN pages p ON p.id = cc.page_id
+                 WHERE cc.symbol_name_qualified = ANY($1::text[])
+                   AND p.source_id = $2
+                 LIMIT ${NEIGHBOR_CAP_PER_HOP}`,
+                [unresolvedTargets, opts.sourceId],
+              )
+            : await engine.executeRaw<{ id: number }>(
+                // chunk-visibility-ok: code symbol targets: code pages are never segmented (chooseBodyStorage)
+                `SELECT id FROM content_chunks WHERE symbol_name_qualified = ANY($1::text[]) LIMIT ${NEIGHBOR_CAP_PER_HOP}`,
+                [unresolvedTargets],
+              );
           for (const r of resolved) directChunkIds.push(r.id);
         } catch {
           // best-effort
@@ -171,7 +215,7 @@ export async function hydrateChunks(
             cc.id as chunk_id, cc.chunk_index, cc.chunk_text, cc.chunk_source
        FROM content_chunks cc
        JOIN pages p ON p.id = cc.page_id
-       WHERE cc.id = ANY($1::int[])`,
+       WHERE cc.id = ANY($1::int[]) AND ${chunkVisibleFilter('p', 'cc')}`,
     [chunkIds],
   );
   return rows.map((r) => ({
